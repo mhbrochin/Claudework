@@ -3,24 +3,27 @@ const { ContextStore } = require('./context/store')
 const { startServer } = require('./ui/server')
 const { launchReviewer } = require('./launcher/reviewer')
 const { isConfigured } = require('./config/agent-config')
+const logger = require('./observability/logger')
+const { initSentry } = require('./observability/errors')
 
 process.on('uncaughtException', (err) => {
-  console.error('[uncaughtException]', err)
+  logger.error({ err }, '[uncaughtException]')
 })
 
 process.on('unhandledRejection', (reason) => {
-  console.error('[unhandledRejection]', reason)
+  logger.error({ reason }, '[unhandledRejection]')
 })
 
 async function main() {
+  initSentry()
   if (!isConfigured('codex')) {
-    console.warn('[config] OPENAI_API_KEY not set — codex sessions will fail. Add it to .env')
+    logger.warn('[config] OPENAI_API_KEY not set — codex sessions will fail. Add it to .env')
   }
   const storeFactory = (sessionId, workdir) => new ContextStore(sessionId, workdir)
   startServer({ store: storeFactory, createSession, launchReviewer })
 }
 
 main().catch((err) => {
-  console.error('[startup error]', err)
+  logger.error({ err }, '[startup error]')
   process.exit(1)
 })

@@ -1,22 +1,21 @@
-// Context store — structured, persistent log for a single AI session.
-// Captures I/O events, file diffs, and flagged decisions.
-// The buildReviewPrompt() method is the key output: a formatted string
-// ready to inject into a second agent as its opening context.
+// Context store — persists session events (I/O, diffs, flagged decisions) to SQLite.
 //
 // INTERFACE CONTRACT (do not change exports):
 //   new ContextStore(sessionId, workdir)
-//     .append(type, data)       — type: 'input'|'output'|'diff'|'decision'
-//     .flag(note)               — mark a decision worth explaining to a reviewer
-//     .export()                 → raw JSON
-//     .buildReviewPrompt()      → formatted string prompt for the reviewer agent
+//     .append(type, data)         — add an event
+//     .flag(note)                 — shorthand for append('decision', { note })
+//     .export()                   → raw JSON
+//     .buildReviewPrompt()        → formatted string prompt for the reviewer agent
 
-const { createSession, appendEvent, getSession, getEvents, endSession } = require('../db/sessions-repo')
+const { createSession, appendEvent, getSession, getEvents } = require('../db/sessions-repo')
+const logger = require('../observability/logger')
 
 class ContextStore {
   constructor(sessionId, workdir) {
     this.sessionId = sessionId
     this.workdir = workdir || process.cwd()
     createSession(sessionId, this.workdir, null, new Date().toISOString())
+    logger.debug({ sessionId: this.sessionId }, 'store initialized')
   }
 
   append(type, data) {

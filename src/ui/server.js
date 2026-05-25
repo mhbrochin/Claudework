@@ -83,8 +83,9 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
           sessionStore = typeof store === 'function' ? store(sessionId, workdir) : store
           session = createSession(agent, workdir, sessionId)
         } catch (err) {
-          safeSend(ws, { type: 'exit', sessionId, code: -1 })
+          safeSend(ws, { type: 'ready', sessionId, agent, workdir, role: 'primary' })
           safeSend(ws, { type: 'output', sessionId, data: `\r\n[error] ${err.message}\r\n` })
+          safeSend(ws, { type: 'exit', sessionId, code: -1 })
           return
         }
         sessions.set(sessionId, { session, store: sessionStore, agent, workdir })

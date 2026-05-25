@@ -71,6 +71,9 @@ function createSession(command, workdir, sessionId) {
   shell.onExit(({ exitCode }) => {
     try { watcher.close() } catch (_) {}
     logger.info({ sessionId, exitCode }, 'session ended')
+    if (exitCode === 127) {
+      session.emit('data', { ts: Date.now(), raw: `\r\n\r\n[hint] Command not found: "${command}"\r\nInstall it with: npm install -g @anthropic-ai/claude-code\r\nThen restart the server.\r\nFull diagnosis: http://localhost:3000/api/health\r\n` })
+    }
     session.emit('exit', { code: exitCode })
   })
 

@@ -20,10 +20,36 @@ const crypto = require('crypto')
 const { execSync } = require('child_process')
 const express = require('express')
 const { WebSocketServer } = require('ws')
-const { loadConfig, isConfigured } = require('../config/agent-config')
-const { listSessions } = require('../db/sessions-repo')
+const { loadConfig, isConfigured, getAgentStatus } = require('../config/agent-config')
 const logger = require('../observability/logger')
 const { captureException } = require('../observability/errors')
+
+// SQLite is optional — if better-sqlite3 fails (missing native binary, Xcode tools, etc.)
+// the app still works; sessions just aren't persisted across restarts.
+let listSessions = () => []
+let ContextStoreSafe
+try {
+  listSessions = require('../db/sessions-repo').listSessions
+} catch (err) {
+  logger.warn({ err: err.message }, 'SQLite unavailable — sessions will not be persisted')
+}
+try {
+  ContextStoreSafe = require('../context/store').ContextStore
+} catch (err) {
+  logger.warn({ err: err.message }, 'ContextStore unavailable — using memory store')
+}
+
+class MemoryStore {
+  constructor(sessionId, workdir) {
+    this.sessionId = sessionId
+    this.workdir = workdir || process.cwd()
+    this.events = []
+  }
+  append(type, data) { this.events.push({ type, ts: new Date().toISOString(), ...data }) }
+  flag(note) { this.append('decision', { note }) }
+  export() { return { sessionId: this.sessionId, workdir: this.workdir, events: this.events } }
+  buildReviewPrompt() { return `# Session: ${this.sessionId}\n(no events persisted)` }
+}
 
 function startServer({ store, createSession, launchReviewer, port = 3000 }) {
   const app = express()
@@ -53,6 +79,32 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
     } catch (err) {
       res.status(500).json({ error: err.message })
     }
+  })
+
+  app.get('/api/health', (req, res) => {
+    const agentStatus = getAgentStatus()
+    let sqliteOk = false
+    let sqliteError = null
+    try {
+      require('../db/database').getDb()
+      sqliteOk = true
+    } catch (err) {
+      sqliteError = err.message
+    }
+    const health = {
+      status: (agentStatus.claude.found && sqliteOk) ? 'ok' : 'degraded',
+      sqlite: sqliteOk ? 'ok' : `unavailable — ${sqliteError}`,
+      agents: agentStatus,
+      node: process.version,
+      platform: process.platform,
+      instructions: {
+        installClaude: 'npm install -g @anthropic-ai/claude-code',
+        installCodex: 'npm install -g @openai/codex',
+        addOpenAiKey: 'echo "OPENAI_API_KEY=sk-..." >> .env  (then restart the server)',
+        fixSqlite: 'xcode-select --install  (macOS — installs native build tools)',
+      },
+    }
+    res.json(health)
   })
 
   // Debug endpoint — visit /api/debug to see environment info
@@ -88,9 +140,12 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
       info.shellPath.loginPath = '(could not resolve)'
     }
 
+    const agentStatus = getAgentStatus()
     info.auth = {
-      claude: isConfigured('claude') ? 'desktop' : 'not_configured',
-      codex: isConfigured('codex') ? 'configured' : 'missing_key',
+      claude: agentStatus.claude.found ? 'found' : 'not_found — run: npm install -g @anthropic-ai/claude-code',
+      claudePath: agentStatus.claude.path,
+      codex: agentStatus.codex.found ? (agentStatus.codex.apiKey ? 'ready' : 'found_no_key') : 'not_found',
+      codexPath: agentStatus.codex.path,
     }
 
     res.json(info)
@@ -141,22 +196,45 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
       if (msg.type === 'start') {
         const sessionId = crypto.randomUUID()
         const agent = msg.agent || 'claude'
-        const workdir = msg.workdir || process.cwd()
+        // Resolve '.' or empty workdir to absolute path so PTY cwd is unambiguous
+        const rawWorkdir = msg.workdir && msg.workdir.trim() ? msg.workdir.trim() : process.cwd()
+        const workdir = require('path').resolve(rawWorkdir)
 
         if (!isConfigured(agent)) {
+          const status = getAgentStatus()
+          const agentStatus = status[agent]
+          let hint = `\r\n[error] "${agent}" is not ready.\r\n`
+          if (agent === 'claude' && !agentStatus.found) {
+            hint += `  Claude CLI not found. Install it:\r\n  npm install -g @anthropic-ai/claude-code\r\n`
+          } else if (agent === 'codex' && !agentStatus.apiKey) {
+            hint += `  OPENAI_API_KEY is not set. Add it to your .env file:\r\n  echo "OPENAI_API_KEY=sk-..." >> .env\r\n`
+          } else if (agent === 'codex' && !agentStatus.found) {
+            hint += `  Codex CLI not found. Install it:\r\n  npm install -g @openai/codex\r\n`
+          }
+          hint += `\r\n  Check full status: http://localhost:3000/api/health\r\n`
           safeSend(ws, { type: 'ready', sessionId, agent, workdir, role: 'primary' })
-          safeSend(ws, { type: 'output', sessionId, data: `\r\n[error] Agent "${agent}" is not configured.\r\nFor codex: add OPENAI_API_KEY to your .env file.\r\nVisit http://localhost:3000/api/debug for details.\r\n` })
+          safeSend(ws, { type: 'output', sessionId, data: hint })
           safeSend(ws, { type: 'exit', sessionId, code: -1 })
           return
         }
 
-        let session, sessionStore
+        // Create store — fall back to memory store if SQLite/ContextStore unavailable
+        let sessionStore
         try {
-          sessionStore = typeof store === 'function' ? store(sessionId, workdir) : store
+          if (ContextStoreSafe) {
+            sessionStore = typeof store === 'function' ? store(sessionId, workdir) : store
+          }
+        } catch (err) {
+          logger.warn({ err: err.message }, 'ContextStore failed, using memory store')
+        }
+        if (!sessionStore) sessionStore = new MemoryStore(sessionId, workdir)
+
+        let session
+        try {
           session = createSession(agent, workdir, sessionId)
         } catch (err) {
           safeSend(ws, { type: 'ready', sessionId, agent, workdir, role: 'primary' })
-          safeSend(ws, { type: 'output', sessionId, data: `\r\n[error] ${err.message}\r\n\r\nTip: visit http://localhost:3000/api/debug to see environment info\r\n` })
+          safeSend(ws, { type: 'output', sessionId, data: `\r\n[error] ${err.message}\r\n\r\nRun: http://localhost:3000/api/health for a full diagnosis\r\n` })
           safeSend(ws, { type: 'exit', sessionId, code: -1 })
           return
         }

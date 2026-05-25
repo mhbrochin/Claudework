@@ -187,6 +187,10 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
 
   wss.on('connection', (ws) => {
     const ownedSessions = new Set()
+    // Persists reviewer output after the session entry is deleted from the Map.
+    // wireSession's exit handler deletes the session; this Map survives that deletion
+    // so cross-check and send-to-primary can still read the captured output.
+    const capturedOutputs = new Map()
 
     ws.on('message', (buf) => {
       let msg
@@ -282,8 +286,60 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         }
         sessions.set(reviewerId, { session: reviewer, store: sourceStore, agent: reviewerAgent, workdir })
         ownedSessions.add(reviewerId)
+        // Register BEFORE wireSession so this fires first on exit (EventEmitter fires in
+        // registration order). wireSession's exit handler deletes the session from the Map,
+        // so we must save capturedOutput to capturedOutputs before that happens.
+        reviewer.once('exit', () => {
+          capturedOutputs.set(reviewerId, reviewer.capturedOutput || null)
+          safeSend(ws, { type: 'reviewer-done', reviewerSessionId: reviewerId, sourceSessionId: msg.sessionId })
+        })
         wireSession(ws, reviewerId, reviewer, sourceStore)
         safeSend(ws, { type: 'ready', sessionId: reviewerId, agent: reviewerAgent, workdir, role: 'reviewer', sourceSessionId: msg.sessionId })
+        return
+      }
+
+      if (msg.type === 'cross-check') {
+        // Launch the cross-agent: send reviewer's output back to the opposite AI
+        const reviewerEntry = sessions.get(msg.reviewerSessionId)
+        const sourceEntry   = sessions.get(msg.sourceSessionId)
+        const sourceStore   = sourceEntry && sourceEntry.store ? sourceEntry.store : (reviewerEntry && reviewerEntry.store)
+        const reviewerOutput = capturedOutputs.get(msg.reviewerSessionId) || '(reviewer output not captured)'
+        const crossAgent = msg.agent || 'claude'   // default: send back to Claude
+        const workdir = (sourceEntry && sourceEntry.workdir) || (reviewerEntry && reviewerEntry.workdir) || process.cwd()
+        const crossId = crypto.randomUUID()
+        let crossSession
+        try {
+          crossSession = launchReviewer(sourceStore, crossAgent, workdir, reviewerOutput)
+        } catch (err) {
+          safeSend(ws, { type: 'ready', sessionId: crossId, agent: crossAgent, workdir, role: 'cross-check' })
+          safeSend(ws, { type: 'output', sessionId: crossId, data: `\r\n[error] ${err.message}\r\n` })
+          safeSend(ws, { type: 'exit', sessionId: crossId, code: -1 })
+          return
+        }
+        sessions.set(crossId, { session: crossSession, store: sourceStore, agent: crossAgent, workdir })
+        ownedSessions.add(crossId)
+        wireSession(ws, crossId, crossSession, sourceStore)
+        safeSend(ws, { type: 'ready', sessionId: crossId, agent: crossAgent, workdir, role: 'cross-check', sourceSessionId: msg.sourceSessionId })
+        return
+      }
+
+      if (msg.type === 'send-to-primary') {
+        // Feature 1: paste the reviewer's captured output into the primary Claude session
+        // so Claude can read the reviewer's analysis and respond to it.
+        const output = capturedOutputs.get(msg.reviewerSessionId)
+        const primaryEntry = sessions.get(msg.primarySessionId)
+        if (!output) {
+          if (primaryEntry) {
+            safeSend(ws, { type: 'output', sessionId: msg.primarySessionId, data: '\r\n[info] No reviewer output available — did the reviewer finish?\r\n' })
+          }
+          return
+        }
+        if (!primaryEntry || !primaryEntry.session || typeof primaryEntry.session.write !== 'function') {
+          safeSend(ws, { type: 'output', sessionId: msg.primarySessionId, data: '\r\n[info] Primary session not available.\r\n' })
+          return
+        }
+        // Write as if pasted by user — no trailing \r so Claude sees it as editable text
+        primaryEntry.session.write(output)
         return
       }
     })
@@ -296,6 +352,7 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         }
         sessions.delete(id)
       }
+      capturedOutputs.clear()
     })
   })
 
@@ -313,10 +370,10 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
       logger.error(`Port ${port} is already in use. Kill the existing process or use a different port.`)
+      process.exit(1)
     } else {
       logger.error({ err }, 'Server error')
     }
-    process.exit(1)
   })
 
   return server

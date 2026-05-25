@@ -3,47 +3,52 @@
 // full context from the prior session.
 //
 // INTERFACE CONTRACT (do not change exports):
-//   launchReviewer(store, agent, workdir) → EventEmitter
+//   launchReviewer(store, agent, workdir, reviewerOutput?) → EventEmitter
 //     store: ContextStore instance (completed session)
 //     agent: 'claude' | 'codex'
 //     workdir: path the reviewer should operate in
+//     reviewerOutput: optional — prior reviewer's output for cross-check mode
 //     Returns the same EventEmitter interface as createSession()
 //
-// The review prompt injected into the agent must include:
-//   1. What was built (summary from store)
-//   2. Every flagged decision and its note
-//   3. All file diffs in unified diff format
-//   4. The full I/O log (condensed — strip raw terminal escape codes)
-//   5. The review instruction:
-//      "Review this session. For each flagged decision, say whether it makes sense
-//       and suggest an alternative if not. Flag any code that contradicts the stated
-//       decisions. List what is missing. Rate overall quality 1-10 with reasoning."
+//   captureOutput(emitter) → Promise<string>
+//     Collects all output from an emitter until exit, returns clean text.
 
 const { EventEmitter } = require('events')
 const pty = require('node-pty')
 
-// Matches ANSI CSI/OSC escape sequences. Built via RegExp constructor so the
-// ESC (0x1B) and CSI (0x9B) control bytes are explicit rather than embedded
-// literally in the source.
-const ANSI_PATTERN = new RegExp(
-  '[\\u001B\\u009B][[\\]()#;?]*' +
-    '(?:(?:(?:[a-zA-Z0-9]*(?:;[a-zA-Z0-9]*)*)?\\u0007)' +
-    '|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[0-9A-PR-TZcf-nq-uy=><~]))',
+// Same ANSI stripper as store.js — must be kept in sync
+const ANSI_RE = new RegExp(
+  '\\x1b(?:' +
+  '\\[[0-9;?]*[A-Za-z~]' +                       // CSI: letter or ~ (incl. bracketed paste)
+  '|\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)' +      // OSC: BEL or ST terminator
+  '|P[^\\x1b]*(?:\\x1b\\\\|$)' +                 // DCS: device control strings
+  '|[^[\\]P]' +                                   // other two-char escapes
+  ')',
   'g'
 )
 
 function stripAnsi(str) {
-  return String(str).replace(ANSI_PATTERN, '')
+  return String(str)
+    .replace(ANSI_RE, '')
+    .replace(/[^\x20-\x7E\n\r\t]/g, '')
+    .replace(/\r\n|\r/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
 }
 
-function launchReviewer(store, agent, workdir) {
+function launchReviewer(store, agent, workdir, reviewerOutput = null) {
   const { loadConfig } = require('../config/agent-config')
   const agentConfig = loadConfig()
   const agentEnv = (agentConfig[agent] && agentConfig[agent].env) || process.env
 
-  const prompt = stripAnsi(store.buildReviewPrompt())
+  // Build the review prompt — pass reviewerOutput for cross-check mode
+  const prompt = store.buildReviewPrompt(reviewerOutput)
 
-  const proc = pty.spawn(agent, [], {
+  const resolvedBin = (agentConfig[agent] && agentConfig[agent].bin) || agent
+  // Spawn through the login shell so PATH includes wherever claude/codex are installed.
+  // Mirrors the same pattern used in pty-session.js for primary sessions.
+  const loginShell = process.env.SHELL || '/bin/bash'
+  const proc = pty.spawn(loginShell, ['-lc', resolvedBin], {
     name: 'xterm-color',
     cols: 120,
     rows: 40,
@@ -53,11 +58,16 @@ function launchReviewer(store, agent, workdir) {
 
   const emitter = new EventEmitter()
 
+  // Capture raw output for cross-check use
+  const outputChunks = []
+
   proc.onData((raw) => {
+    outputChunks.push(raw)
     emitter.emit('data', { ts: Date.now(), raw })
   })
 
   proc.onExit(({ exitCode }) => {
+    emitter.capturedOutput = stripAnsi(outputChunks.join(''))
     emitter.emit('exit', { code: exitCode })
   })
 
@@ -67,13 +77,21 @@ function launchReviewer(store, agent, workdir) {
   }
 
   emitter.resize = (cols, rows) => proc.resize(cols, rows)
-  emitter.kill = (signal) => proc.kill(signal)
+  emitter.kill = (signal) => { try { proc.kill(signal) } catch (_) {} }
   emitter.pid = proc.pid
 
-  process.nextTick(() => {
-    emitter.emit('input', { ts: Date.now(), raw: prompt })
-    proc.write(prompt)
-  })
+  // Wait for the CLI to render its welcome screen before injecting the prompt
+  // (avoids the prompt being swallowed during startup)
+  let promptSent = false
+  const sendPrompt = () => {
+    if (promptSent) return
+    promptSent = true
+    // \r is the PTY Enter key — submits the prompt in interactive CLIs
+    proc.write(prompt + '\r')
+  }
+
+  // Send after a short delay to let the CLI initialise
+  setTimeout(sendPrompt, 2000)
 
   return emitter
 }

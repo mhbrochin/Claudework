@@ -64,12 +64,16 @@ function createSession(command, workdir, sessionId) {
   session.pid = shell.pid
   logger.info({ sessionId, command, pid: shell.pid, workdir: absWorkdir }, 'session started')
 
+  // Declare watcher here so the onExit closure below can reference it without
+  // being in the TDZ. It is assigned further down once chokidar.watch() is called.
+  let watcher
+
   shell.onData((raw) => {
     session.emit('data', { ts: Date.now(), raw })
   })
 
   shell.onExit(({ exitCode }) => {
-    try { watcher.close() } catch (_) {}
+    try { if (watcher) watcher.close() } catch (_) {}
     logger.info({ sessionId, exitCode }, 'session ended')
     if (exitCode === 127) {
       session.emit('data', { ts: Date.now(), raw: `\r\n\r\n[hint] Command not found: "${command}"\r\nInstall it with: npm install -g @anthropic-ai/claude-code\r\nThen restart the server.\r\nFull diagnosis: http://localhost:3000/api/health\r\n` })
@@ -93,10 +97,11 @@ function createSession(command, workdir, sessionId) {
   const git = simpleGit(absWorkdir)
   const pending = new Map()
 
-  const watcher = chokidar.watch(absWorkdir, {
+  watcher = chokidar.watch(absWorkdir, {
     ignored: [
       /(^|[\/\\])\../,
       /node_modules/,
+      /contextbridge\.db/,
     ],
     ignoreInitial: true,
     persistent: true,

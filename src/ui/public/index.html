@@ -142,6 +142,8 @@
     <button id="btnNew">New Session</button>
     <button id="btnFlag" disabled>Flag Decision</button>
     <button id="btnReview" disabled>Send to Reviewer</button>
+    <button id="btnSendA" disabled>Send to Panel A</button>
+    <button id="btnCrossCheck" disabled>Cross-Check</button>
     <button id="btnExport" disabled>Export Context</button>
     <span style="flex:1"></span>
     <span id="status" style="font-size:11px; color:#8b949e;">disconnected</span>
@@ -214,17 +216,15 @@
     const terminalsEl = document.getElementById('terminals')
     const panelB = document.getElementById('panelB')
 
-    const panels = {
-      A: makePanel('termA', 'statusA', 'agentA'),
-      B: makePanel('termB', 'statusB', 'agentB'),
-    }
-
     let primarySessionId = null
     let reviewerSessionId = null
     const sessionToPanel = new Map()
     const sessionMeta = new Map()
 
-    function makePanel(termId, statusId, agentId) {
+    // deferOpen=true delays term.open() until the container is visible.
+    // Opening xterm while display:none gives it zero cols/rows — the renderer
+    // breaks and typing never works. Call panel.openNow() after revealing the element.
+    function makePanel(termId, statusId, agentId, deferOpen = false) {
       const term = new Terminal({
         convertEol: true,
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
@@ -233,14 +233,27 @@
       })
       const fit = new FitAddon()
       term.loadAddon(fit)
-      term.open(document.getElementById(termId))
-      try { fit.fit() } catch (_) {}
+      let opened = false
+      const openNow = () => {
+        if (opened) return
+        opened = true
+        term.open(document.getElementById(termId))
+        try { fit.fit() } catch (_) {}
+      }
+      if (!deferOpen) openNow()
+      document.getElementById(termId).addEventListener('click', () => { openNow(); term.focus() })
       return {
-        term, fit,
+        term, fit, openNow,
         statusEl: document.getElementById(statusId),
         agentEl: document.getElementById(agentId),
         sessionId: null,
+        dataDisposable: null,   // tracks the onData listener so we can dispose before re-registering
       }
+    }
+
+    const panels = {
+      A: makePanel('termA', 'statusA', 'agentA'),
+      B: makePanel('termB', 'statusB', 'agentB', true),  // deferred — Panel B starts hidden
     }
 
     window.addEventListener('resize', () => {
@@ -274,18 +287,30 @@
       sessionToPanel.set(sessionId, panelKey)
       sessionMeta.set(sessionId, { agent, panelKey })
 
-      panel.term.onData((data) => {
+      // Dispose the previous onData listener before registering a new one.
+      // Without this, every call to setActiveSession stacks another listener,
+      // causing each keystroke to be sent N times (once per session started).
+      if (panel.dataDisposable) { panel.dataDisposable.dispose(); panel.dataDisposable = null }
+      panel.dataDisposable = panel.term.onData((data) => {
         if (!panel.sessionId) return
         send({ type: 'input', sessionId: panel.sessionId, data })
       })
+
+      panel.term.focus()
     }
 
     function showReviewerPanel() {
       panelB.classList.remove('hidden')
       terminalsEl.classList.remove('single')
+      // Open the xterm renderer NOW that the container is visible.
+      // If we opened it while hidden (display:none) it would have zero cols/rows.
+      panels.B.openNow()
       try { panels.A.fit.fit() } catch (_) {}
       try { panels.B.fit.fit() } catch (_) {}
     }
+
+    // Clicking anywhere in panel B (header, term, etc.) ensures it's open and focused
+    document.getElementById('panelB').addEventListener('click', () => { panels.B.openNow(); panels.B.term.focus() })
 
     ws.addEventListener('open', () => {
       statusEl.textContent = 'connected'
@@ -296,6 +321,8 @@
       log('info', 'WebSocket closed')
       document.getElementById('btnFlag').disabled = true
       document.getElementById('btnReview').disabled = true
+      document.getElementById('btnSendA').disabled = true
+      document.getElementById('btnCrossCheck').disabled = true
       document.getElementById('btnExport').disabled = true
     })
 
@@ -306,11 +333,14 @@
       const panel = panelKey ? panels[panelKey] : null
 
       if (msg.type === 'ready') {
-        if (msg.role === 'reviewer') {
+        if (msg.role === 'reviewer' || msg.role === 'cross-check') {
           reviewerSessionId = msg.sessionId
           showReviewerPanel()
           setActiveSession('B', msg.sessionId, msg.agent)
-          log('ready', `Reviewer session ready (${msg.agent}) — ${msg.sessionId}`)
+          // Delay focus until after panel is painted and xterm has resized
+          setTimeout(() => panels.B.term.focus(), 300)
+          const label = msg.role === 'cross-check' ? 'Cross-check' : 'Reviewer'
+          log('ready', `${label} session ready (${msg.agent}) — ${msg.sessionId}`)
         } else {
           primarySessionId = msg.sessionId
           setActiveSession('A', msg.sessionId, msg.agent)
@@ -319,6 +349,12 @@
           document.getElementById('btnReview').disabled = false
           document.getElementById('btnExport').disabled = false
         }
+      } else if (msg.type === 'reviewer-done') {
+        // Reviewer finished — enable Send to Panel A and Cross-Check buttons
+        reviewerSessionId = msg.reviewerSessionId
+        document.getElementById('btnSendA').disabled = false
+        document.getElementById('btnCrossCheck').disabled = false
+        log('ready', `Reviewer done — Send to Panel A pastes the analysis into Claude, or Cross-Check launches a rebuttal`)
       } else if (msg.type === 'output') {
         if (panel) panel.term.write(msg.data)
       } else if (msg.type === 'diff') {
@@ -359,6 +395,23 @@
     document.getElementById('btnReview').addEventListener('click', () => {
       if (!primarySessionId) return
       document.getElementById('reviewModal').classList.remove('hidden')
+    })
+
+    document.getElementById('btnSendA').addEventListener('click', () => {
+      if (!primarySessionId || !reviewerSessionId) return
+      // Paste the reviewer's captured output into Panel A (Claude's PTY) so Claude
+      // can read the reviewer's analysis and compose a rebuttal in its own session.
+      send({ type: 'send-to-primary', primarySessionId, reviewerSessionId })
+      document.getElementById('btnSendA').disabled = true
+      log('info', 'Sending reviewer analysis to Panel A — Claude will see it as pasted input')
+    })
+
+    document.getElementById('btnCrossCheck').addEventListener('click', () => {
+      if (!primarySessionId || !reviewerSessionId) return
+      // Cross-check: launch a fresh Claude session pre-loaded with the reviewer's output
+      send({ type: 'cross-check', sourceSessionId: primarySessionId, reviewerSessionId, agent: 'claude' })
+      document.getElementById('btnCrossCheck').disabled = true
+      log('info', 'Launching Claude cross-check of reviewer analysis...')
     })
     document.getElementById('reviewCancel').addEventListener('click', () => {
       document.getElementById('reviewModal').classList.add('hidden')

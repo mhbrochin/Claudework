@@ -17,6 +17,7 @@
 const path = require('path')
 const http = require('http')
 const crypto = require('crypto')
+const { execSync } = require('child_process')
 const express = require('express')
 const { WebSocketServer } = require('ws')
 
@@ -34,13 +35,51 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
     }
   })
 
+  // Debug endpoint — visit /api/debug to see environment info
+  app.get('/api/debug', (req, res) => {
+    const shell = process.env.SHELL || '/bin/bash'
+    const info = {
+      node: process.version,
+      platform: process.platform,
+      shell,
+      cwd: process.cwd(),
+      path: process.env.PATH || '(not set)',
+      agents: {},
+      shellPath: {},
+    }
+
+    for (const agent of ['claude', 'codex']) {
+      try {
+        const which = execSync(`${shell} -lc "which ${agent}"`, { timeout: 5000 }).toString().trim()
+        info.agents[agent] = which || 'not found'
+      } catch (_) {
+        try {
+          const which2 = execSync(`which ${agent}`, { timeout: 3000 }).toString().trim()
+          info.agents[agent] = which2 || 'not found'
+        } catch (_2) {
+          info.agents[agent] = 'not found'
+        }
+      }
+    }
+
+    try {
+      info.shellPath.loginPath = execSync(`${shell} -lc "echo $PATH"`, { timeout: 5000 }).toString().trim()
+    } catch (_) {
+      info.shellPath.loginPath = '(could not resolve)'
+    }
+
+    res.json(info)
+  })
+
   const server = http.createServer(app)
   const wss = new WebSocketServer({ server })
 
   const sessions = new Map()
 
   const safeSend = (ws, msg) => {
-    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg))
+    try {
+      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg))
+    } catch (_) {}
   }
 
   const wireSession = (ws, sessionId, session, sessionStore) => {
@@ -84,7 +123,7 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
           session = createSession(agent, workdir, sessionId)
         } catch (err) {
           safeSend(ws, { type: 'ready', sessionId, agent, workdir, role: 'primary' })
-          safeSend(ws, { type: 'output', sessionId, data: `\r\n[error] ${err.message}\r\n` })
+          safeSend(ws, { type: 'output', sessionId, data: `\r\n[error] ${err.message}\r\n\r\nTip: visit http://localhost:3000/api/debug to see environment info\r\n` })
           safeSend(ws, { type: 'exit', sessionId, code: -1 })
           return
         }
@@ -125,8 +164,9 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         try {
           reviewer = launchReviewer(sourceStore, reviewerAgent, workdir)
         } catch (err) {
-          safeSend(ws, { type: 'exit', sessionId: reviewerId, code: -1 })
+          safeSend(ws, { type: 'ready', sessionId: reviewerId, agent: reviewerAgent, workdir, role: 'reviewer' })
           safeSend(ws, { type: 'output', sessionId: reviewerId, data: `\r\n[error] ${err.message}\r\n` })
+          safeSend(ws, { type: 'exit', sessionId: reviewerId, code: -1 })
           return
         }
         sessions.set(reviewerId, { session: reviewer, store: sourceStore, agent: reviewerAgent, workdir })
@@ -149,7 +189,17 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
   })
 
   server.listen(port, () => {
-    console.log(`ContextBridge UI listening on http://localhost:${port}`)
+    console.log(`ContextBridge listening on http://localhost:${port}`)
+    console.log(`Debug info: http://localhost:${port}/api/debug`)
+  })
+
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Port ${port} is already in use. Kill the existing process or use a different port.`)
+    } else {
+      console.error('Server error:', err)
+    }
+    process.exit(1)
   })
 
   return server

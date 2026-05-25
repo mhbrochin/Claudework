@@ -17,6 +17,10 @@ const chokidar = require('chokidar')
 const simpleGit = require('simple-git')
 
 function createSession(command, workdir, sessionId) {
+  const { loadConfig } = require('../config/agent-config')
+  const agentConfig = loadConfig()
+  const agentEnv = (agentConfig[command] && agentConfig[command].env) || process.env
+
   // Validate workdir exists and is accessible
   try {
     fs.accessSync(workdir, fs.constants.R_OK)
@@ -49,7 +53,7 @@ function createSession(command, workdir, sessionId) {
       cols: 120,
       rows: 30,
       cwd: absWorkdir,
-      env: process.env,
+      env: agentEnv,
     })
   } catch (err) {
     throw new Error(`Failed to spawn PTY (${loginShell} -lc ${command}): ${err.message}`)

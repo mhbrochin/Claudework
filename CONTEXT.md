@@ -26,6 +26,23 @@ The server.js WebSocket message format is the contract between the UI (browser) 
 **sessions/ directory for runtime files**
 JSON context logs are written to sessions/{sessionId}.json at runtime. This directory is gitignored for logs but tracked for structure.
 
+### 2026-05-25 — PTY capture (feature/pty-capture)
+
+**Returned object is an EventEmitter with extra methods**
+`createSession` returns an EventEmitter augmented with `write(raw)`, `resize(cols, rows)`, `kill(signal)`, plus `pid`, `sessionId`, `workdir`. The web-ui session calls `session.write()` to forward browser keystrokes; that path is where 'input' events are emitted, so anything bypassing `write()` (writing to the pty handle directly) will not be logged.
+
+**Command parsing is whitespace-split, not shell-evaluated**
+`createSession('claude --foo bar', ...)` spawns `claude` with `['--foo','bar']` via node-pty. No shell interpolation, no quoted-arg handling. If callers need a shell, they should pass `bash -lc '...'`.
+
+**Diff strategy: simple-git against the workdir, debounced per file**
+chokidar watches `workdir` with `ignoreInitial: true` and ignores dotfiles + `node_modules`. On add/change/unlink we debounce ~150ms per relative path, then run `git diff -- <path>`. If the working-tree diff is empty we fall back to `--cached`, then to a `--no-index` diff against `/dev/null` so brand-new untracked files still produce a patch. Files outside the workdir are dropped.
+
+**awaitWriteFinish on the watcher**
+chokidar's `awaitWriteFinish` (100ms stability) prevents firing on partial writes from editors that do open→write→close in multiple syscalls.
+
+**Watcher lifecycle tied to the PTY**
+The chokidar watcher is closed inside `onExit` so the session is fully releasable; callers do not need to clean it up.
+
 ---
 
 ## Open Questions

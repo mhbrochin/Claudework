@@ -8,10 +8,96 @@
 //            'diff'  { ts, file, patch }  — git diff after a file write is detected
 //            'exit'  { code }             — process exited
 
-// TODO: implement in feature/pty-capture
+const { EventEmitter } = require('events')
+const path = require('path')
+const os = require('os')
+const pty = require('node-pty')
+const chokidar = require('chokidar')
+const simpleGit = require('simple-git')
 
 function createSession(command, workdir, sessionId) {
-  throw new Error('Not implemented — see feature/pty-capture')
+  const session = new EventEmitter()
+  session.sessionId = sessionId
+  session.workdir = workdir
+
+  const parts = command.trim().split(/\s+/)
+  const file = parts[0]
+  const args = parts.slice(1)
+
+  const shell = pty.spawn(file, args, {
+    name: 'xterm-256color',
+    cols: 120,
+    rows: 30,
+    cwd: workdir,
+    env: process.env,
+  })
+
+  session.pid = shell.pid
+
+  shell.onData((raw) => {
+    session.emit('data', { ts: Date.now(), raw })
+  })
+
+  shell.onExit(({ exitCode }) => {
+    try { watcher.close() } catch (_) {}
+    session.emit('exit', { code: exitCode })
+  })
+
+  session.write = (raw) => {
+    session.emit('input', { ts: Date.now(), raw })
+    shell.write(raw)
+  }
+
+  session.resize = (cols, rows) => {
+    shell.resize(cols, rows)
+  }
+
+  session.kill = (signal) => {
+    shell.kill(signal)
+  }
+
+  const git = simpleGit(workdir)
+  const pending = new Map()
+
+  const watcher = chokidar.watch(workdir, {
+    ignored: [
+      /(^|[\/\\])\../,
+      /node_modules/,
+    ],
+    ignoreInitial: true,
+    persistent: true,
+    awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 50 },
+  })
+
+  const handleChange = async (filePath) => {
+    const rel = path.relative(workdir, filePath)
+    if (!rel || rel.startsWith('..')) return
+
+    if (pending.has(rel)) clearTimeout(pending.get(rel))
+    pending.set(rel, setTimeout(async () => {
+      pending.delete(rel)
+      try {
+        let patch = await git.diff(['--', rel])
+        if (!patch) {
+          patch = await git.diff(['--cached', '--', rel])
+        }
+        if (!patch) {
+          patch = await git.raw(['diff', '--no-index', '--', '/dev/null', filePath]).catch(() => '')
+        }
+        if (patch) {
+          session.emit('diff', { ts: Date.now(), file: rel, patch })
+        }
+      } catch (err) {
+        session.emit('diff', { ts: Date.now(), file: rel, patch: `# diff error: ${err.message}${os.EOL}` })
+      }
+    }, 150))
+  }
+
+  watcher.on('add', handleChange)
+  watcher.on('change', handleChange)
+  watcher.on('unlink', handleChange)
+
+  return session
 }
 
 module.exports = { createSession }

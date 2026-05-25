@@ -31,3 +31,37 @@ JSON context logs are written to sessions/{sessionId}.json at runtime. This dire
 ## Open Questions
 - Should the context store persist to disk in real time or only on session end? (Current lean: real time, to survive crashes)
 - Should the reviewer session see the raw terminal output or a cleaned version? (Current lean: strip ANSI escape codes but keep all content)
+
+---
+
+### 2026-05-25 — Review launcher (src/launcher/reviewer.js)
+
+**Returned object mirrors createSession() shape, plus a `write` method**
+The pty-capture contract says the session emits `data` / `input` / `exit`.
+The launcher's emitter does the same so the UI can attach the same handlers
+to a reviewer session as to a primary session. Added `write(raw)` (also
+emits `input` so keystrokes are captured if the caller wants to log the
+reviewer session too), plus `resize`, `kill`, and `pid` passthroughs — these
+aren't in the documented contract but are needed for any real PTY consumer
+and don't conflict with the emitter interface.
+
+**Prompt injection happens on `process.nextTick` after spawn**
+Writing synchronously right after `pty.spawn` can race the child before its
+stdin is wired through the PTY master. A nextTick defer is enough to land
+the write after the spawn settles without introducing a real delay. The
+write is also emitted as an `input` event so the prompt appears in any
+downstream log of the reviewer session.
+
+**ANSI stripping applied to the prompt only, not to live PTY output**
+The contract says "strip ANSI escape codes from the prompt before
+injecting" — that's a one-shot scrub of the buildReviewPrompt() string.
+Live data from the reviewer's own PTY is forwarded raw via the `data`
+event so the UI's terminal renderer (xterm.js) gets the formatting it
+expects. The ANSI regex is built via `new RegExp` with explicit ``
+/ `` escapes so the source file stays free of literal control bytes.
+
+**Agent spawned with no extra args**
+`pty.spawn(agent, [], …)` — the contract says agent is `'claude'` or
+`'codex'` and the prompt is delivered over stdin, so no CLI flags are
+needed. If a future caller wants flags (e.g. `--model`), that's an
+interface change and belongs in a follow-up, not here.

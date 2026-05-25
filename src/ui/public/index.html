@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>ContextBridge</title>
+  <!--
+    UI CONTRACT — implement in feature/web-ui:
+
+    Layout (three panels):
+      TOP LEFT  — Session A terminal (xterm.js), label shows agent name
+      TOP RIGHT — Session B terminal (xterm.js), initially blank until reviewer launched
+      BOTTOM    — Context log panel: live scrolling event feed from the active session
+
+    Toolbar buttons:
+      [ New Session ]     — opens modal: pick agent (claude/codex), set workdir
+      [ Flag Decision ]   — prompts for a note, sends { type:'flag' } to server
+      [ Send to Reviewer ]— picks reviewer agent, sends { type:'review' } to server
+                            → Session B panel activates with the reviewer session
+      [ Export Context ]  — downloads session JSON from /api/sessions/:id/export
+
+    xterm.js CDN:
+      https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css
+      https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js
+      https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js
+  -->
+</head>
+<body>
+  <p>ContextBridge UI — not yet implemented (see feature/web-ui)</p>
+</body>
+</html>

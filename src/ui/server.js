@@ -20,6 +20,7 @@ const crypto = require('crypto')
 const { execSync } = require('child_process')
 const express = require('express')
 const { WebSocketServer } = require('ws')
+const { loadConfig, isConfigured } = require('../config/agent-config')
 
 function startServer({ store, createSession, launchReviewer, port = 3000 }) {
   const app = express()
@@ -66,6 +67,11 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
       info.shellPath.loginPath = execSync(`${shell} -lc "echo $PATH"`, { timeout: 5000 }).toString().trim()
     } catch (_) {
       info.shellPath.loginPath = '(could not resolve)'
+    }
+
+    info.auth = {
+      claude: isConfigured('claude') ? 'desktop' : 'not_configured',
+      codex: isConfigured('codex') ? 'configured' : 'missing_key',
     }
 
     res.json(info)
@@ -117,6 +123,14 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         const sessionId = crypto.randomUUID()
         const agent = msg.agent || 'claude'
         const workdir = msg.workdir || process.cwd()
+
+        if (!isConfigured(agent)) {
+          safeSend(ws, { type: 'ready', sessionId, agent, workdir, role: 'primary' })
+          safeSend(ws, { type: 'output', sessionId, data: `\r\n[error] Agent "${agent}" is not configured.\r\nFor codex: add OPENAI_API_KEY to your .env file.\r\nVisit http://localhost:3000/api/debug for details.\r\n` })
+          safeSend(ws, { type: 'exit', sessionId, code: -1 })
+          return
+        }
+
         let session, sessionStore
         try {
           sessionStore = typeof store === 'function' ? store(sessionId, workdir) : store

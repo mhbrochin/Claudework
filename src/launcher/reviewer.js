@@ -37,6 +37,10 @@ function stripAnsi(str) {
 }
 
 function launchReviewer(store, agent, workdir) {
+  const { loadConfig } = require('../config/agent-config')
+  const agentConfig = loadConfig()
+  const agentEnv = (agentConfig[agent] && agentConfig[agent].env) || process.env
+
   const prompt = stripAnsi(store.buildReviewPrompt())
 
   const proc = pty.spawn(agent, [], {
@@ -44,7 +48,7 @@ function launchReviewer(store, agent, workdir) {
     cols: 120,
     rows: 40,
     cwd: workdir,
-    env: process.env,
+    env: agentEnv,
   })
 
   const emitter = new EventEmitter()

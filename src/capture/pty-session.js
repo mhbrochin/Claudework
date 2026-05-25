@@ -15,6 +15,7 @@ const os = require('os')
 const pty = require('node-pty')
 const chokidar = require('chokidar')
 const simpleGit = require('simple-git')
+const logger = require('../observability/logger')
 
 function createSession(command, workdir, sessionId) {
   // Validate workdir exists and is accessible
@@ -52,10 +53,12 @@ function createSession(command, workdir, sessionId) {
       env: process.env,
     })
   } catch (err) {
+    logger.error({ err, command, workdir: absWorkdir }, 'PTY spawn failed')
     throw new Error(`Failed to spawn PTY (${loginShell} -lc ${command}): ${err.message}`)
   }
 
   session.pid = shell.pid
+  logger.info({ sessionId, command, pid: shell.pid, workdir: absWorkdir }, 'session started')
 
   shell.onData((raw) => {
     session.emit('data', { ts: Date.now(), raw })
@@ -63,6 +66,7 @@ function createSession(command, workdir, sessionId) {
 
   shell.onExit(({ exitCode }) => {
     try { watcher.close() } catch (_) {}
+    logger.info({ sessionId, exitCode }, 'session ended')
     session.emit('exit', { code: exitCode })
   })
 

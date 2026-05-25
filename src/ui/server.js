@@ -20,10 +20,20 @@ const crypto = require('crypto')
 const { execSync } = require('child_process')
 const express = require('express')
 const { WebSocketServer } = require('ws')
+const logger = require('../observability/logger')
+const { captureException } = require('../observability/errors')
 
 function startServer({ store, createSession, launchReviewer, port = 3000 }) {
   const app = express()
   app.use(express.static(path.join(__dirname, 'public')))
+
+  app.use((req, res, next) => {
+    const start = Date.now()
+    res.on('finish', () => {
+      logger.info({ method: req.method, url: req.url, status: res.statusCode, ms: Date.now() - start }, 'request')
+    })
+    next()
+  })
 
   app.get('/api/sessions/:id/export', (req, res) => {
     const entry = sessions.get(req.params.id)
@@ -188,16 +198,22 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
     })
   })
 
+  app.use((err, req, res, next) => {
+    logger.error({ err }, 'unhandled express error')
+    captureException(err)
+    res.status(500).json({ error: 'Internal server error' })
+  })
+
   server.listen(port, () => {
-    console.log(`ContextBridge listening on http://localhost:${port}`)
-    console.log(`Debug info: http://localhost:${port}/api/debug`)
+    logger.info(`ContextBridge listening on http://localhost:${port}`)
+    logger.info(`Debug info: http://localhost:${port}/api/debug`)
   })
 
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
-      console.error(`Port ${port} is already in use. Kill the existing process or use a different port.`)
+      logger.error(`Port ${port} is already in use. Kill the existing process or use a different port.`)
     } else {
-      console.error('Server error:', err)
+      logger.error({ err }, 'Server error')
     }
     process.exit(1)
   })

@@ -12,6 +12,7 @@
 
 const fs = require('fs')
 const path = require('path')
+const logger = require('../observability/logger')
 
 const ANSI_REGEX = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[@-_]/g
 
@@ -31,6 +32,7 @@ class ContextStore {
 
     fs.mkdirSync(this.sessionsDir, { recursive: true })
     this._persist()
+    logger.debug({ sessionId: this.sessionId }, 'store initialized')
   }
 
   append(type, data) {
@@ -129,7 +131,11 @@ class ContextStore {
 
   _persist() {
     const payload = JSON.stringify(this.export(), null, 2)
-    fs.writeFileSync(this.filePath, payload)
+    try {
+      fs.writeFileSync(this.filePath, payload)
+    } catch (err) {
+      logger.error({ err, sessionId: this.sessionId }, 'failed to persist session')
+    }
   }
 }
 

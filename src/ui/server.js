@@ -80,7 +80,7 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         const workdir = msg.workdir || process.cwd()
         let session, sessionStore
         try {
-          sessionStore = store
+          sessionStore = typeof store === 'function' ? store(sessionId, workdir) : store
           session = createSession(agent, workdir, sessionId)
         } catch (err) {
           safeSend(ws, { type: 'exit', sessionId, code: -1 })

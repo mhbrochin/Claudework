@@ -4,8 +4,9 @@ const { startServer } = require('./ui/server')
 const { launchReviewer } = require('./launcher/reviewer')
 
 async function main() {
-  const store = new ContextStore()
-  startServer({ store, createSession, launchReviewer })
+  // Pass a factory so each session gets its own isolated store
+  const storeFactory = (sessionId, workdir) => new ContextStore(sessionId, workdir)
+  startServer({ store: storeFactory, createSession, launchReviewer })
 }
 
 main().catch(console.error)

@@ -24,6 +24,7 @@
       background: #161b22;
       border-bottom: 1px solid #30363d;
       flex: 0 0 auto;
+      flex-wrap: wrap;
     }
     header h1 {
       margin: 0;
@@ -43,6 +44,10 @@
     }
     button:hover:not(:disabled) { background: #30363d; }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #btnVolleyStart { border-color: #a371f7; color: #a371f7; }
+    #btnVolleyStart:hover:not(:disabled) { background: #2d1b69; }
+    #btnVolleyStop  { background: #3d1a1a; border-color: #f85149; color: #f85149; }
+    #btnVolleyStop:hover { background: #5a1f1f; }
     main {
       flex: 1 1 auto;
       display: grid;
@@ -77,14 +82,9 @@
       align-items: center;
       flex: 0 0 auto;
     }
-    .panel-header .label-tag {
-      color: #58a6ff;
-      font-weight: 600;
-    }
-    .panel-header .agent-tag {
-      color: #f0883e;
-      font-size: 10px;
-    }
+    .panel-header .label-tag  { color: #58a6ff; font-weight: 600; }
+    .panel-header .agent-tag  { color: #f0883e; font-size: 10px; }
+    .panel-header .role-tag   { color: #a371f7; font-size: 10px; margin-left: 4px; }
     .active { color: #3fb950; }
     .term {
       flex: 1 1 auto;
@@ -103,13 +103,15 @@
       min-height: 0;
     }
     #log .entry { padding: 2px 0; border-bottom: 1px solid #161b22; white-space: pre-wrap; word-break: break-word; }
-    #log .ts { color: #6e7681; margin-right: 8px; }
-    #log .tag { font-weight: 600; margin-right: 6px; }
-    #log .tag.flag { color: #f0883e; }
-    #log .tag.diff { color: #3fb950; }
-    #log .tag.ready { color: #58a6ff; }
-    #log .tag.exit { color: #f85149; }
-    #log .tag.info { color: #8b949e; }
+    #log .ts          { color: #6e7681; margin-right: 8px; }
+    #log .tag         { font-weight: 600; margin-right: 6px; }
+    #log .tag.flag    { color: #f0883e; }
+    #log .tag.diff    { color: #3fb950; }
+    #log .tag.ready   { color: #58a6ff; }
+    #log .tag.exit    { color: #f85149; }
+    #log .tag.info    { color: #8b949e; }
+    #log .tag.volley  { color: #a371f7; }
+    #log .tag.synth   { color: #58a6ff; }
     .modal-backdrop {
       position: fixed; inset: 0;
       background: rgba(0,0,0,0.6);
@@ -130,6 +132,7 @@
       background: #0d1117; color: #e6edf3;
       border: 1px solid #30363d; border-radius: 4px; font-size: 13px;
     }
+    .modal p.hint { font-size: 11px; color: #8b949e; margin: 10px 0 0; }
     .modal-actions {
       display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px;
     }
@@ -142,10 +145,13 @@
     <button id="btnNew">New Session</button>
     <button id="btnFlag" disabled>Flag Decision</button>
     <button id="btnReview" disabled>Send to Reviewer</button>
+    <button id="btnVolleyStart" disabled>⚡ Start Volley</button>
+    <button id="btnVolleyStop" class="hidden">Stop Volley</button>
     <button id="btnSendA" disabled>Send to Panel A</button>
     <button id="btnCrossCheck" disabled>Cross-Check</button>
     <button id="btnExport" disabled>Export Context</button>
     <span style="flex:1"></span>
+    <span id="volleyStatus" style="font-size:11px; color:#a371f7;"></span>
     <span id="status" style="font-size:11px; color:#8b949e;">disconnected</span>
   </header>
 
@@ -153,14 +159,21 @@
     <div id="terminals" class="single">
       <section class="panel" id="panelA">
         <div class="panel-header">
-          <span><span class="label-tag">Session A</span> <span class="agent-tag" id="agentA">—</span></span>
+          <span>
+            <span class="label-tag">Session A</span>
+            <span class="agent-tag" id="agentA">—</span>
+          </span>
           <span id="statusA">idle</span>
         </div>
         <div class="term" id="termA"></div>
       </section>
       <section class="panel hidden" id="panelB">
         <div class="panel-header">
-          <span><span class="label-tag">Session B (Reviewer)</span> <span class="agent-tag" id="agentB">—</span></span>
+          <span>
+            <span class="label-tag" id="panelBLabel">Session B</span>
+            <span class="agent-tag" id="agentB">—</span>
+            <span class="role-tag" id="roleB"></span>
+          </span>
           <span id="statusB">idle</span>
         </div>
         <div class="term" id="termB"></div>
@@ -169,6 +182,7 @@
     <div id="log"></div>
   </main>
 
+  <!-- New Session modal -->
   <div id="newModal" class="modal-backdrop hidden">
     <div class="modal">
       <h2>New Session</h2>
@@ -181,6 +195,9 @@
       <label>Workdir
         <input id="newWorkdir" type="text" value="." />
       </label>
+      <label>Task (what are you asking this AI to do?)
+        <input id="newTask" type="text" placeholder="e.g. Review this app for security issues" />
+      </label>
       <div class="modal-actions">
         <button id="newCancel">Cancel</button>
         <button id="newStart">Start</button>
@@ -188,6 +205,7 @@
     </div>
   </div>
 
+  <!-- Review modal -->
   <div id="reviewModal" class="modal-backdrop hidden">
     <div class="modal">
       <h2>Send to Reviewer</h2>
@@ -204,6 +222,50 @@
     </div>
   </div>
 
+  <!-- Start Volley modal -->
+  <div id="volleyModal" class="modal-backdrop hidden">
+    <div class="modal">
+      <h2>⚡ Start Volley</h2>
+      <label>Rounds
+        <select id="volleyRounds">
+          <option value="1">1</option>
+          <option value="3" selected>3 (recommended)</option>
+          <option value="5">5</option>
+          <option value="10">10</option>
+          <option value="20">Up to 20 (stops when both agree)</option>
+        </select>
+      </label>
+      <label>Focus (optional)
+        <input id="volleyFocus" type="text" placeholder="e.g. security, trading logic, architecture…" />
+      </label>
+      <p class="hint">Agents are assigned automatically: whoever is in Panel A is the live agent, the other reviews.</p>
+      <div class="modal-actions">
+        <button id="volleyCancel">Cancel</button>
+        <button id="volleyGo">Start Volley</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Continue Volley modal -->
+  <div id="volleyContinueModal" class="modal-backdrop hidden">
+    <div class="modal">
+      <h2>Continue Volley?</h2>
+      <p class="hint">Round limit reached. Add more rounds to continue the debate.</p>
+      <label>Additional rounds
+        <select id="volleyExtraRounds">
+          <option value="1">1</option>
+          <option value="3" selected>3</option>
+          <option value="5">5</option>
+          <option value="10">10</option>
+        </select>
+      </label>
+      <div class="modal-actions">
+        <button id="volleyContinueCancel">No thanks</button>
+        <button id="volleyContinueGo">Continue</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     const { Terminal } = window
     const FitAddon = window.FitAddon.FitAddon
@@ -211,15 +273,17 @@
     const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:'
     const ws = new WebSocket(`${wsProto}//${location.host}`)
 
-    const statusEl = document.getElementById('status')
-    const logEl = document.getElementById('log')
-    const terminalsEl = document.getElementById('terminals')
-    const panelB = document.getElementById('panelB')
+    const statusEl      = document.getElementById('status')
+    const logEl         = document.getElementById('log')
+    const terminalsEl   = document.getElementById('terminals')
+    const panelBEl      = document.getElementById('panelB')
+    const volleyStatusEl = document.getElementById('volleyStatus')
 
-    let primarySessionId = null
+    let primarySessionId  = null
     let reviewerSessionId = null
-    const sessionToPanel = new Map()
-    const sessionMeta = new Map()
+    let primaryAgent      = null   // agent in Panel A — used for symmetric cross-check and volley
+    const sessionToPanel  = new Map()
+    const sessionMeta     = new Map()
 
     // deferOpen=true delays term.open() until the container is visible.
     // Opening xterm while display:none gives it zero cols/rows — the renderer
@@ -245,7 +309,7 @@
       return {
         term, fit, openNow,
         statusEl: document.getElementById(statusId),
-        agentEl: document.getElementById(agentId),
+        agentEl:  document.getElementById(agentId),
         sessionId: null,
         dataDisposable: null,   // tracks the onData listener so we can dispose before re-registering
       }
@@ -299,12 +363,15 @@
       panel.term.focus()
     }
 
-    function showReviewerPanel() {
-      panelB.classList.remove('hidden')
+    function showReviewerPanel(labelText, roleText) {
+      panelBEl.classList.remove('hidden')
       terminalsEl.classList.remove('single')
       // Open the xterm renderer NOW that the container is visible.
       // If we opened it while hidden (display:none) it would have zero cols/rows.
       panels.B.openNow()
+      if (labelText) document.getElementById('panelBLabel').textContent = labelText
+      if (roleText)  document.getElementById('roleB').textContent = roleText
+      else            document.getElementById('roleB').textContent = ''
       try { panels.A.fit.fit() } catch (_) {}
       try { panels.B.fit.fit() } catch (_) {}
     }
@@ -321,54 +388,139 @@
       log('info', 'WebSocket closed')
       document.getElementById('btnFlag').disabled = true
       document.getElementById('btnReview').disabled = true
+      document.getElementById('btnVolleyStart').disabled = true
+      document.getElementById('btnVolleyStop').classList.add('hidden')
       document.getElementById('btnSendA').disabled = true
       document.getElementById('btnCrossCheck').disabled = true
       document.getElementById('btnExport').disabled = true
+      volleyStatusEl.textContent = ''
     })
 
     ws.addEventListener('message', (ev) => {
       let msg
       try { msg = JSON.parse(ev.data) } catch (_) { return }
       const panelKey = sessionToPanel.get(msg.sessionId)
-      const panel = panelKey ? panels[panelKey] : null
+      const panel    = panelKey ? panels[panelKey] : null
 
+      // ── ready ──────────────────────────────────────────────────────────
       if (msg.type === 'ready') {
-        if (msg.role === 'reviewer' || msg.role === 'cross-check') {
-          reviewerSessionId = msg.sessionId
-          showReviewerPanel()
-          setActiveSession('B', msg.sessionId, msg.agent)
-          // Delay focus until after panel is painted and xterm has resized
-          setTimeout(() => panels.B.term.focus(), 300)
-          const label = msg.role === 'cross-check' ? 'Cross-check' : 'Reviewer'
-          log('ready', `${label} session ready (${msg.agent}) — ${msg.sessionId}`)
-        } else {
+        const role = msg.role || 'primary'
+
+        if (role === 'primary') {
           primarySessionId = msg.sessionId
+          primaryAgent     = msg.agent
           setActiveSession('A', msg.sessionId, msg.agent)
           log('ready', `Session A ready (${msg.agent}) — ${msg.sessionId}`)
           document.getElementById('btnFlag').disabled = false
           document.getElementById('btnReview').disabled = false
+          document.getElementById('btnVolleyStart').disabled = false
           document.getElementById('btnExport').disabled = false
+
+        } else if (role === 'reviewer' || role === 'cross-check') {
+          reviewerSessionId = msg.sessionId
+          const label = role === 'cross-check' ? 'Session B (Cross-Check)' : 'Session B (Reviewer)'
+          showReviewerPanel(label, msg.agent)
+          setActiveSession('B', msg.sessionId, msg.agent)
+          setTimeout(() => panels.B.term.focus(), 300)
+          log('ready', `${role === 'cross-check' ? 'Cross-check' : 'Reviewer'} session ready (${msg.agent}) — ${msg.sessionId}`)
+
+        } else if (role === 'volley-round') {
+          // Fresh reviewer round — show in Panel B
+          showReviewerPanel('Session B (Volley)', msg.agent)
+          setActiveSession('B', msg.sessionId, msg.agent)
+          setTimeout(() => panels.B.term.focus(), 300)
+
+        } else if (role === 'volley-synthesis') {
+          // Synthesis session — show in Panel B
+          showReviewerPanel('Session B (Synthesis)', msg.agent)
+          setActiveSession('B', msg.sessionId, msg.agent)
+          setTimeout(() => panels.B.term.focus(), 300)
+          log('synth', `Synthesis session started (${msg.agent}) — ${msg.sessionId}`)
         }
+
+      // ── reviewer-done ──────────────────────────────────────────────────
       } else if (msg.type === 'reviewer-done') {
-        // Reviewer finished — enable Send to Panel A and Cross-Check buttons
         reviewerSessionId = msg.reviewerSessionId
         document.getElementById('btnSendA').disabled = false
         document.getElementById('btnCrossCheck').disabled = false
-        log('ready', `Reviewer done — Send to Panel A pastes the analysis into Claude, or Cross-Check launches a rebuttal`)
+        log('ready', 'Reviewer done — Send to Panel A pastes the analysis, or Cross-Check launches a rebuttal')
+
+      // ── output ─────────────────────────────────────────────────────────
       } else if (msg.type === 'output') {
         if (panel) panel.term.write(msg.data)
+
+      // ── diff ───────────────────────────────────────────────────────────
       } else if (msg.type === 'diff') {
         log('diff', `${msg.file}\n${msg.patch || ''}`)
+
+      // ── exit ───────────────────────────────────────────────────────────
       } else if (msg.type === 'exit') {
         log('exit', `session ${msg.sessionId} exited (code ${msg.code})`)
         if (panel) {
           panel.statusEl.textContent = `exited (${msg.code})`
           panel.statusEl.classList.remove('active')
         }
+        // If the primary session exits, disable primary-only buttons
+        if (msg.sessionId === primarySessionId) {
+          document.getElementById('btnFlag').disabled = true
+          document.getElementById('btnReview').disabled = true
+          document.getElementById('btnVolleyStart').disabled = true
+        }
+
+      // ── volley messages ────────────────────────────────────────────────
+      } else if (msg.type === 'volley-round-start') {
+        const roundLabel = `Round ${msg.round + 1} of ${msg.maxRounds} — ${msg.agent} responding…`
+        volleyStatusEl.textContent = roundLabel
+        log('volley', roundLabel)
+        // Show Stop Volley button
+        document.getElementById('btnVolleyStop').classList.remove('hidden')
+        document.getElementById('btnVolleyStart').disabled = true
+
+      } else if (msg.type === 'volley-round-complete') {
+        const preview = (msg.output || '').slice(0, 120).replace(/\n/g, ' ')
+        log('volley', `Round ${msg.round + 1} complete (${msg.agent}) — ${preview}…`)
+
+      } else if (msg.type === 'volley-convergence') {
+        log('volley', `✓ ${msg.message}`)
+        volleyStatusEl.textContent = 'Both agents agree — synthesizing…'
+
+      } else if (msg.type === 'volley-synthesis-start') {
+        const modeLabel = msg.mode === 'where-things-left-off' ? 'Synthesizing where things left off…' : 'Running final synthesis…'
+        volleyStatusEl.textContent = modeLabel
+        log('synth', modeLabel)
+
+      } else if (msg.type === 'volley-done') {
+        // Restore volley buttons
+        document.getElementById('btnVolleyStart').disabled = false
+        document.getElementById('btnVolleyStop').classList.add('hidden')
+        volleyStatusEl.textContent = ''
+
+        // Make synthesis output available via Send to Panel A
+        reviewerSessionId = 'volley-final'
+        document.getElementById('btnSendA').disabled = false
+
+        const reasonLabel = {
+          'converged':       '✓ Volley complete — both agents converged',
+          'round-limit':     'Round limit reached',
+          'stopped':         'Volley stopped by user',
+          'synthesis-error': 'Synthesis failed — check logs',
+        }[msg.reason] || `Volley ended (${msg.reason})`
+        log('volley', `${reasonLabel} — ${msg.rounds} round(s)`)
+
+        // Offer to continue if round limit was hit
+        if (msg.canContinue) {
+          document.getElementById('volleyContinueModal').classList.remove('hidden')
+        }
+
+      } else if (msg.type === 'volley-error') {
+        document.getElementById('btnVolleyStart').disabled = false
+        document.getElementById('btnVolleyStop').classList.add('hidden')
+        volleyStatusEl.textContent = ''
+        log('exit', `Volley error${msg.round != null ? ` (round ${msg.round + 1})` : ''}: ${msg.error}`)
       }
     })
 
-    // Toolbar handlers
+    // ── New Session ───────────────────────────────────────────────────────
     document.getElementById('btnNew').addEventListener('click', () => {
       document.getElementById('newModal').classList.remove('hidden')
     })
@@ -376,13 +528,15 @@
       document.getElementById('newModal').classList.add('hidden')
     })
     document.getElementById('newStart').addEventListener('click', () => {
-      const agent = document.getElementById('newAgent').value
+      const agent   = document.getElementById('newAgent').value
       const workdir = document.getElementById('newWorkdir').value || '.'
-      send({ type: 'start', agent, workdir })
+      const task    = document.getElementById('newTask').value.trim()
+      send({ type: 'start', agent, workdir, ...(task ? { task } : {}) })
       document.getElementById('newModal').classList.add('hidden')
-      log('info', `Requesting new ${agent} session in ${workdir}`)
+      log('info', `Requesting new ${agent} session in ${workdir}${task ? ` — Task: ${task}` : ''}`)
     })
 
+    // ── Flag Decision ─────────────────────────────────────────────────────
     document.getElementById('btnFlag').addEventListener('click', () => {
       if (!primarySessionId) return
       const note = window.prompt('Flag note — explain the decision:')
@@ -392,26 +546,10 @@
       }
     })
 
+    // ── Send to Reviewer ──────────────────────────────────────────────────
     document.getElementById('btnReview').addEventListener('click', () => {
       if (!primarySessionId) return
       document.getElementById('reviewModal').classList.remove('hidden')
-    })
-
-    document.getElementById('btnSendA').addEventListener('click', () => {
-      if (!primarySessionId || !reviewerSessionId) return
-      // Paste the reviewer's captured output into Panel A (Claude's PTY) so Claude
-      // can read the reviewer's analysis and compose a rebuttal in its own session.
-      send({ type: 'send-to-primary', primarySessionId, reviewerSessionId })
-      document.getElementById('btnSendA').disabled = true
-      log('info', 'Sending reviewer analysis to Panel A — Claude will see it as pasted input')
-    })
-
-    document.getElementById('btnCrossCheck').addEventListener('click', () => {
-      if (!primarySessionId || !reviewerSessionId) return
-      // Cross-check: launch a fresh Claude session pre-loaded with the reviewer's output
-      send({ type: 'cross-check', sourceSessionId: primarySessionId, reviewerSessionId, agent: 'claude' })
-      document.getElementById('btnCrossCheck').disabled = true
-      log('info', 'Launching Claude cross-check of reviewer analysis...')
     })
     document.getElementById('reviewCancel').addEventListener('click', () => {
       document.getElementById('reviewModal').classList.add('hidden')
@@ -423,15 +561,67 @@
       log('info', `Launching ${reviewerAgent} reviewer`)
     })
 
+    // ── Start Volley ──────────────────────────────────────────────────────
+    document.getElementById('btnVolleyStart').addEventListener('click', () => {
+      if (!primarySessionId) return
+      document.getElementById('volleyModal').classList.remove('hidden')
+    })
+    document.getElementById('volleyCancel').addEventListener('click', () => {
+      document.getElementById('volleyModal').classList.add('hidden')
+    })
+    document.getElementById('volleyGo').addEventListener('click', () => {
+      const maxRounds  = parseInt(document.getElementById('volleyRounds').value, 10)
+      const focusHint  = document.getElementById('volleyFocus').value.trim()
+      send({ type: 'volley-start', sessionId: primarySessionId, maxRounds, ...(focusHint ? { focusHint } : {}) })
+      document.getElementById('volleyModal').classList.add('hidden')
+      log('volley', `Starting ${maxRounds}-round volley${focusHint ? ` — focus: ${focusHint}` : ''}`)
+    })
+
+    // ── Stop Volley ───────────────────────────────────────────────────────
+    document.getElementById('btnVolleyStop').addEventListener('click', () => {
+      send({ type: 'volley-stop' })
+      log('volley', 'Stop requested…')
+    })
+
+    // ── Continue Volley ───────────────────────────────────────────────────
+    document.getElementById('volleyContinueCancel').addEventListener('click', () => {
+      document.getElementById('volleyContinueModal').classList.add('hidden')
+    })
+    document.getElementById('volleyContinueGo').addEventListener('click', () => {
+      const extraRounds = parseInt(document.getElementById('volleyExtraRounds').value, 10)
+      send({ type: 'volley-continue', sessionId: primarySessionId, extraRounds })
+      document.getElementById('volleyContinueModal').classList.add('hidden')
+      log('volley', `Continuing volley — adding ${extraRounds} more round(s)`)
+    })
+
+    // ── Send to Panel A ───────────────────────────────────────────────────
+    document.getElementById('btnSendA').addEventListener('click', () => {
+      if (!primarySessionId || !reviewerSessionId) return
+      send({ type: 'send-to-primary', primarySessionId, reviewerSessionId })
+      document.getElementById('btnSendA').disabled = true
+      log('info', 'Sending reviewer/synthesis analysis to Panel A')
+    })
+
+    // ── Cross-Check ───────────────────────────────────────────────────────
+    document.getElementById('btnCrossCheck').addEventListener('click', () => {
+      if (!primarySessionId || !reviewerSessionId) return
+      // Send the opposite of whoever is in Panel A — read from primaryAgent
+      const crossAgent = (primaryAgent === 'claude') ? 'codex' : 'claude'
+      send({ type: 'cross-check', sourceSessionId: primarySessionId, reviewerSessionId, agent: crossAgent })
+      document.getElementById('btnCrossCheck').disabled = true
+      log('info', `Launching ${crossAgent} cross-check of reviewer analysis…`)
+    })
+
+    // ── Export Context ────────────────────────────────────────────────────
     document.getElementById('btnExport').addEventListener('click', async () => {
       const id = primarySessionId
       if (!id) return
       try {
-        const res = await fetch(`/api/sessions/${id}/export`)
+        const res  = await fetch(`/api/sessions/${id}/export`)
         const data = await res.json()
         const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
-        const url = URL.createObjectURL(blob)
-        const a = document.createElement('a')
+        const url  = URL.createObjectURL(blob)
+        const a    = document.createElement('a')
         a.href = url
         a.download = `session-${id}.json`
         document.body.appendChild(a)

@@ -2,3 +2,4 @@ node_modules/
 sessions/*.json
 .env
 contextbridge.db
+volley-log.md

@@ -5,23 +5,35 @@
 //   startServer({ store, createSession, launchReviewer, port? })
 //     Starts on port 3000 by default.
 //     WebSocket message protocol:
-//       browser → server: { type: 'input', sessionId, data }
-//                         { type: 'start', agent, workdir }
-//                         { type: 'review', sessionId, reviewerAgent }
-//                         { type: 'flag', sessionId, note }
-//       server → browser: { type: 'output', sessionId, data }
-//                         { type: 'diff',   sessionId, file, patch }
-//                         { type: 'ready',  sessionId }
-//                         { type: 'exit',   sessionId, code }
+//       browser → server: { type: 'input',          sessionId, data }
+//                         { type: 'start',           agent, workdir, task? }
+//                         { type: 'review',          sessionId, reviewerAgent }
+//                         { type: 'flag',            sessionId, note }
+//                         { type: 'cross-check',     sourceSessionId, reviewerSessionId, agent? }
+//                         { type: 'send-to-primary', primarySessionId, reviewerSessionId }
+//                         { type: 'volley-start',    sessionId, maxRounds?, focusHint? }
+//                         { type: 'volley-stop' }
+//                         { type: 'volley-continue', sessionId, extraRounds?, focusHint? }
+//       server → browser: { type: 'output',               sessionId, data }
+//                         { type: 'diff',                 sessionId, file, patch }
+//                         { type: 'ready',                sessionId, role }
+//                         { type: 'exit',                 sessionId, code }
+//                         { type: 'reviewer-done',        reviewerSessionId, sourceSessionId }
+//                         { type: 'volley-round-start',   round, agent, maxRounds }
+//                         { type: 'volley-round-complete',round, agent, output }
+//                         { type: 'volley-convergence',   message }
+//                         { type: 'volley-synthesis-start',mode }
+//                         { type: 'volley-done',          rounds, reason, canContinue?, synthOutput? }
+//                         { type: 'volley-error',         error, round? }
 
-const path = require('path')
-const http = require('http')
-const crypto = require('crypto')
+const path     = require('path')
+const http     = require('http')
+const crypto   = require('crypto')
 const { execSync } = require('child_process')
-const express = require('express')
+const express  = require('express')
 const { WebSocketServer } = require('ws')
 const { loadConfig, isConfigured, getAgentStatus } = require('../config/agent-config')
-const logger = require('../observability/logger')
+const logger   = require('../observability/logger')
 const { captureException } = require('../observability/errors')
 
 // SQLite is optional — if better-sqlite3 fails (missing native binary, Xcode tools, etc.)
@@ -39,16 +51,30 @@ try {
   logger.warn({ err: err.message }, 'ContextStore unavailable — using memory store')
 }
 
+// VolleyManager is loaded lazily inside the handler so a missing module doesn't
+// crash the whole server — it degrades gracefully with a volley-error response.
+let VolleyManagerSafe
+try {
+  VolleyManagerSafe = require('../volley/volley-manager').VolleyManager
+} catch (err) {
+  logger.warn({ err: err.message }, 'VolleyManager unavailable — volley feature disabled')
+}
+
 class MemoryStore {
   constructor(sessionId, workdir) {
     this.sessionId = sessionId
-    this.workdir = workdir || process.cwd()
-    this.events = []
+    this.workdir   = workdir || process.cwd()
+    this.events    = []
   }
   append(type, data) { this.events.push({ type, ts: new Date().toISOString(), ...data }) }
-  flag(note) { this.append('decision', { note }) }
-  export() { return { sessionId: this.sessionId, workdir: this.workdir, events: this.events } }
-  buildReviewPrompt() { return `# Session: ${this.sessionId}\n(no events persisted)` }
+  flag(note)          { this.append('decision', { note }) }
+  export()            { return { sessionId: this.sessionId, workdir: this.workdir, events: this.events } }
+  buildReviewPrompt(reviewerOutput = null, options = {}) {
+    return `# Session: ${this.sessionId}\n(no events persisted)`
+  }
+  buildSynthesisPrompt(rounds = [], taskPrompt = '') {
+    return `# Final Synthesis\nTask: ${taskPrompt || '(none)'}\n(no events persisted — ${rounds.length} round(s) recorded)`
+  }
 }
 
 function startServer({ store, createSession, launchReviewer, port = 3000 }) {
@@ -64,7 +90,7 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
   })
 
   app.get('/api/sessions/:id/export', (req, res) => {
-    const entry = sessions.get(req.params.id)
+    const entry  = sessions.get(req.params.id)
     const target = entry && entry.store ? entry.store : store
     try {
       res.json(target.export())
@@ -95,13 +121,13 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
       status: (agentStatus.claude.found && sqliteOk) ? 'ok' : 'degraded',
       sqlite: sqliteOk ? 'ok' : `unavailable — ${sqliteError}`,
       agents: agentStatus,
-      node: process.version,
+      node:   process.version,
       platform: process.platform,
       instructions: {
         installClaude: 'npm install -g @anthropic-ai/claude-code',
-        installCodex: 'npm install -g @openai/codex',
-        addOpenAiKey: 'echo "OPENAI_API_KEY=sk-..." >> .env  (then restart the server)',
-        fixSqlite: 'xcode-select --install  (macOS — installs native build tools)',
+        installCodex:  'npm install -g @openai/codex',
+        addOpenAiKey:  'echo "OPENAI_API_KEY=sk-..." >> .env  (then restart the server)',
+        fixSqlite:     'xcode-select --install  (macOS — installs native build tools)',
       },
     }
     res.json(health)
@@ -110,11 +136,11 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
   // Debug endpoint — visit /api/debug to see environment info
   app.get('/api/debug', (req, res) => {
     const shell = process.env.SHELL || '/bin/bash'
-    const info = {
+    const info  = {
       node: process.version,
       platform: process.platform,
       shell,
-      cwd: process.cwd(),
+      cwd:  process.cwd(),
       path: process.env.PATH || '(not set)',
       agents: {},
       shellPath: {},
@@ -142,18 +168,19 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
 
     const agentStatus = getAgentStatus()
     info.auth = {
-      claude: agentStatus.claude.found ? 'found' : 'not_found — run: npm install -g @anthropic-ai/claude-code',
+      claude:     agentStatus.claude.found ? 'found' : 'not_found — run: npm install -g @anthropic-ai/claude-code',
       claudePath: agentStatus.claude.path,
-      codex: agentStatus.codex.found ? (agentStatus.codex.apiKey ? 'ready' : 'found_no_key') : 'not_found',
-      codexPath: agentStatus.codex.path,
+      codex:      agentStatus.codex.found ? (agentStatus.codex.apiKey ? 'ready' : 'found_no_key') : 'not_found',
+      codexPath:  agentStatus.codex.path,
     }
 
     res.json(info)
   })
 
   const server = http.createServer(app)
-  const wss = new WebSocketServer({ server })
+  const wss    = new WebSocketServer({ server })
 
+  // sessions Map: sessionId → { session, store, agent, workdir }
   const sessions = new Map()
 
   const safeSend = (ws, msg) => {
@@ -171,7 +198,7 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
       safeSend(ws, { type: 'output', sessionId, data: raw })
     })
     session.on('diff', (evt) => {
-      const file = evt && evt.file
+      const file  = evt && evt.file
       const patch = evt && evt.patch
       if (sessionStore && typeof sessionStore.append === 'function') {
         try { sessionStore.append('diff', { ts: Date.now(), file, patch }) } catch (_) {}
@@ -191,21 +218,24 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
     // wireSession's exit handler deletes the session; this Map survives that deletion
     // so cross-check and send-to-primary can still read the captured output.
     const capturedOutputs = new Map()
+    // At most one active volley per WebSocket connection
+    let activeVolley = null
 
     ws.on('message', (buf) => {
       let msg
       try { msg = JSON.parse(buf.toString()) } catch (_) { return }
       if (!msg || typeof msg !== 'object') return
 
+      // ── start ────────────────────────────────────────────────────────────
       if (msg.type === 'start') {
-        const sessionId = crypto.randomUUID()
-        const agent = msg.agent || 'claude'
+        const sessionId  = crypto.randomUUID()
+        const agent      = msg.agent || 'claude'
         // Resolve '.' or empty workdir to absolute path so PTY cwd is unambiguous
         const rawWorkdir = msg.workdir && msg.workdir.trim() ? msg.workdir.trim() : process.cwd()
-        const workdir = require('path').resolve(rawWorkdir)
+        const workdir    = require('path').resolve(rawWorkdir)
 
         if (!isConfigured(agent)) {
-          const status = getAgentStatus()
+          const status      = getAgentStatus()
           const agentStatus = status[agent]
           let hint = `\r\n[error] "${agent}" is not ready.\r\n`
           if (agent === 'claude' && !agentStatus.found) {
@@ -233,6 +263,11 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         }
         if (!sessionStore) sessionStore = new MemoryStore(sessionId, workdir)
 
+        // Persist the user's task description if provided
+        if (msg.task && typeof msg.task === 'string' && msg.task.trim()) {
+          try { sessionStore.append('task', { prompt: msg.task.trim(), ts: Date.now() }) } catch (_) {}
+        }
+
         let session
         try {
           session = createSession(agent, workdir, sessionId)
@@ -249,6 +284,7 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         return
       }
 
+      // ── input ────────────────────────────────────────────────────────────
       if (msg.type === 'input') {
         const entry = sessions.get(msg.sessionId)
         if (entry && entry.session && typeof entry.session.write === 'function') {
@@ -260,8 +296,9 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         return
       }
 
+      // ── flag ─────────────────────────────────────────────────────────────
       if (msg.type === 'flag') {
-        const entry = sessions.get(msg.sessionId)
+        const entry  = sessions.get(msg.sessionId)
         const target = entry && entry.store ? entry.store : store
         try { target.flag(msg.note) } catch (err) {
           safeSend(ws, { type: 'output', sessionId: msg.sessionId, data: `\r\n[flag error] ${err.message}\r\n` })
@@ -269,15 +306,17 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         return
       }
 
+      // ── review ───────────────────────────────────────────────────────────
       if (msg.type === 'review') {
-        const sourceEntry = sessions.get(msg.sessionId)
-        const sourceStore = sourceEntry && sourceEntry.store ? sourceEntry.store : store
+        const sourceEntry   = sessions.get(msg.sessionId)
+        const sourceStore   = sourceEntry && sourceEntry.store ? sourceEntry.store : store
         const reviewerAgent = msg.reviewerAgent || 'codex'
-        const workdir = (sourceEntry && sourceEntry.workdir) || process.cwd()
-        const reviewerId = crypto.randomUUID()
+        const workdir       = (sourceEntry && sourceEntry.workdir) || process.cwd()
+        const primaryAgent  = (sourceEntry && sourceEntry.agent) || 'the primary agent'
+        const reviewerId    = crypto.randomUUID()
         let reviewer
         try {
-          reviewer = launchReviewer(sourceStore, reviewerAgent, workdir)
+          reviewer = launchReviewer(sourceStore, reviewerAgent, workdir, null, null, { primaryAgent })
         } catch (err) {
           safeSend(ws, { type: 'ready', sessionId: reviewerId, agent: reviewerAgent, workdir, role: 'reviewer' })
           safeSend(ws, { type: 'output', sessionId: reviewerId, data: `\r\n[error] ${err.message}\r\n` })
@@ -298,18 +337,19 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         return
       }
 
+      // ── cross-check ──────────────────────────────────────────────────────
       if (msg.type === 'cross-check') {
-        // Launch the cross-agent: send reviewer's output back to the opposite AI
-        const reviewerEntry = sessions.get(msg.reviewerSessionId)
-        const sourceEntry   = sessions.get(msg.sourceSessionId)
-        const sourceStore   = sourceEntry && sourceEntry.store ? sourceEntry.store : (reviewerEntry && reviewerEntry.store)
+        const reviewerEntry  = sessions.get(msg.reviewerSessionId)
+        const sourceEntry    = sessions.get(msg.sourceSessionId)
+        const sourceStore    = sourceEntry && sourceEntry.store ? sourceEntry.store : (reviewerEntry && reviewerEntry.store)
         const reviewerOutput = capturedOutputs.get(msg.reviewerSessionId) || '(reviewer output not captured)'
-        const crossAgent = msg.agent || 'claude'   // default: send back to Claude
-        const workdir = (sourceEntry && sourceEntry.workdir) || (reviewerEntry && reviewerEntry.workdir) || process.cwd()
-        const crossId = crypto.randomUUID()
+        const crossAgent     = msg.agent || 'claude'
+        const workdir        = (sourceEntry && sourceEntry.workdir) || (reviewerEntry && reviewerEntry.workdir) || process.cwd()
+        const primaryAgent   = (sourceEntry && sourceEntry.agent) || 'the primary agent'
+        const crossId        = crypto.randomUUID()
         let crossSession
         try {
-          crossSession = launchReviewer(sourceStore, crossAgent, workdir, reviewerOutput)
+          crossSession = launchReviewer(sourceStore, crossAgent, workdir, reviewerOutput, null, { primaryAgent })
         } catch (err) {
           safeSend(ws, { type: 'ready', sessionId: crossId, agent: crossAgent, workdir, role: 'cross-check' })
           safeSend(ws, { type: 'output', sessionId: crossId, data: `\r\n[error] ${err.message}\r\n` })
@@ -323,10 +363,9 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         return
       }
 
+      // ── send-to-primary ───────────────────────────────────────────────────
       if (msg.type === 'send-to-primary') {
-        // Feature 1: paste the reviewer's captured output into the primary Claude session
-        // so Claude can read the reviewer's analysis and respond to it.
-        const output = capturedOutputs.get(msg.reviewerSessionId)
+        const output       = capturedOutputs.get(msg.reviewerSessionId)
         const primaryEntry = sessions.get(msg.primarySessionId)
         if (!output) {
           if (primaryEntry) {
@@ -338,13 +377,120 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
           safeSend(ws, { type: 'output', sessionId: msg.primarySessionId, data: '\r\n[info] Primary session not available.\r\n' })
           return
         }
-        // Write as if pasted by user — no trailing \r so Claude sees it as editable text
-        primaryEntry.session.write(output)
+        // Frame and cap the reviewer output before pasting into the live session
+        const MAX_PASTE_CHARS = 20000
+        const body = output.length > MAX_PASTE_CHARS
+          ? '[...truncated...]\n\n' + output.slice(-MAX_PASTE_CHARS)
+          : output
+        primaryEntry.session.write(`\r\n\r\n=== REVIEWER ANALYSIS ===\r\n${body}\r\n=== END REVIEWER ANALYSIS ===\r\n`)
+        return
+      }
+
+      // ── volley-start ─────────────────────────────────────────────────────
+      if (msg.type === 'volley-start') {
+        if (!VolleyManagerSafe) {
+          safeSend(ws, { type: 'volley-error', error: 'VolleyManager not available — check server logs' })
+          return
+        }
+        if (activeVolley) {
+          safeSend(ws, { type: 'volley-error', error: 'A volley is already running' })
+          return
+        }
+        const sourceEntry = sessions.get(msg.sessionId)
+        if (!sourceEntry) {
+          safeSend(ws, { type: 'volley-error', error: 'Session not found' })
+          return
+        }
+
+        // Symmetric role assignment — whoever is in Panel A is the live agent
+        const liveAgent     = sourceEntry.agent || 'claude'
+        const reviewerAgent = liveAgent === 'claude' ? 'codex' : 'claude'
+        const maxRounds     = Number.isInteger(msg.maxRounds) && msg.maxRounds >= 1
+          ? Math.min(msg.maxRounds, 20) : 3
+
+        activeVolley = new VolleyManagerSafe({
+          liveAgent, reviewerAgent, maxRounds, focusHint: msg.focusHint || '',
+        })
+        activeVolley.once('done', ({ finalOutput }) => {
+          if (finalOutput) capturedOutputs.set('volley-final', finalOutput)
+          activeVolley = null
+        })
+        activeVolley.run(
+          sourceEntry.store, sourceEntry.workdir || process.cwd(),
+          sourceEntry.session, ws, safeSend
+        ).catch(err => {
+          logger.error({ err }, 'volley: run() threw unexpectedly')
+          safeSend(ws, { type: 'volley-error', error: err.message })
+          activeVolley = null
+        })
+        return
+      }
+
+      // ── volley-stop ──────────────────────────────────────────────────────
+      if (msg.type === 'volley-stop') {
+        if (activeVolley) activeVolley.stop()
+        return
+      }
+
+      // ── volley-continue ──────────────────────────────────────────────────
+      if (msg.type === 'volley-continue') {
+        if (!VolleyManagerSafe) {
+          safeSend(ws, { type: 'volley-error', error: 'VolleyManager not available' })
+          return
+        }
+        if (activeVolley) {
+          safeSend(ws, { type: 'volley-error', error: 'A volley is already running' })
+          return
+        }
+        const sourceEntry = sessions.get(msg.sessionId)
+        if (!sourceEntry) {
+          safeSend(ws, { type: 'volley-error', error: 'Session not found' })
+          return
+        }
+
+        // Reconstruct full completedRounds from SQLite so debate history is intact on resume
+        let completedRounds = []
+        try {
+          const allEvents = sourceEntry.store.export().events
+          completedRounds = allEvents
+            .filter(e => e.type === 'volley-round' && e.role !== 'synthesis')
+            .map(e => ({ round: e.round, agent: e.agent, output: e.output || '' }))
+        } catch (_) {}
+
+        const prevOutput      = completedRounds.length ? completedRounds[completedRounds.length - 1].output : null
+        const startFromRound  = completedRounds.length
+        const extraRounds     = Number.isInteger(msg.extraRounds) && msg.extraRounds >= 1
+          ? Math.min(msg.extraRounds, 20) : 3
+
+        const liveAgent     = sourceEntry.agent || 'claude'
+        const reviewerAgent = liveAgent === 'claude' ? 'codex' : 'claude'
+
+        activeVolley = new VolleyManagerSafe({
+          liveAgent, reviewerAgent,
+          maxRounds:  startFromRound + extraRounds,
+          focusHint:  msg.focusHint || '',
+        })
+        activeVolley.once('done', ({ finalOutput }) => {
+          if (finalOutput) capturedOutputs.set('volley-final', finalOutput)
+          activeVolley = null
+        })
+        activeVolley.run(
+          sourceEntry.store, sourceEntry.workdir || process.cwd(),
+          sourceEntry.session, ws, safeSend,
+          startFromRound, prevOutput, completedRounds
+        ).catch(err => {
+          logger.error({ err }, 'volley: continue() threw unexpectedly')
+          safeSend(ws, { type: 'volley-error', error: err.message })
+          activeVolley = null
+        })
         return
       }
     })
 
     ws.on('close', () => {
+      // Stop any running volley
+      if (activeVolley) { activeVolley.stop(); activeVolley = null }
+      // Kill all sessions owned by this connection
       for (const id of ownedSessions) {
         const entry = sessions.get(id)
         if (entry && entry.session && typeof entry.session.kill === 'function') {

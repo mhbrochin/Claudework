@@ -3,15 +3,14 @@
 // full context from the prior session.
 //
 // INTERFACE CONTRACT (do not change exports):
-//   launchReviewer(store, agent, workdir, reviewerOutput?) → EventEmitter
+//   launchReviewer(store, agent, workdir, reviewerOutput?, overridePrompt?, options?) → EventEmitter
 //     store: ContextStore instance (completed session)
 //     agent: 'claude' | 'codex'
 //     workdir: path the reviewer should operate in
-//     reviewerOutput: optional — prior reviewer's output for cross-check mode
+//     reviewerOutput: optional — prior reviewer's output for cross-check / debate-history mode
+//     overridePrompt: optional — if provided, bypasses buildReviewPrompt entirely (used by synthesis)
+//     options: optional — { focusHint?, primaryAgent? } forwarded to buildReviewPrompt
 //     Returns the same EventEmitter interface as createSession()
-//
-//   captureOutput(emitter) → Promise<string>
-//     Collects all output from an emitter until exit, returns clean text.
 
 const { EventEmitter } = require('events')
 const pty = require('node-pty')
@@ -36,13 +35,13 @@ function stripAnsi(str) {
     .trim()
 }
 
-function launchReviewer(store, agent, workdir, reviewerOutput = null) {
+function launchReviewer(store, agent, workdir, reviewerOutput = null, overridePrompt = null, options = {}) {
   const { loadConfig } = require('../config/agent-config')
   const agentConfig = loadConfig()
   const agentEnv = (agentConfig[agent] && agentConfig[agent].env) || process.env
 
-  // Build the review prompt — pass reviewerOutput for cross-check mode
-  const prompt = store.buildReviewPrompt(reviewerOutput)
+  // Build the review prompt — overridePrompt short-circuits buildReviewPrompt (used by synthesis)
+  const prompt = overridePrompt || store.buildReviewPrompt(reviewerOutput, options)
 
   const resolvedBin = (agentConfig[agent] && agentConfig[agent].bin) || agent
   // Spawn through the login shell so PATH includes wherever claude/codex are installed.
@@ -58,7 +57,7 @@ function launchReviewer(store, agent, workdir, reviewerOutput = null) {
 
   const emitter = new EventEmitter()
 
-  // Capture raw output for cross-check use
+  // Capture raw output for cross-check / debate-history use
   const outputChunks = []
 
   proc.onData((raw) => {

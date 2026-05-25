@@ -102,6 +102,7 @@ function createSession(command, workdir, sessionId) {
       /(^|[\/\\])\../,
       /node_modules/,
       /contextbridge\.db/,
+      /volley-log\.md/,
     ],
     ignoreInitial: true,
     persistent: true,

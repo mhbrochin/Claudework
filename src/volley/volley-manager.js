@@ -1,0 +1,330 @@
+'use strict'
+// Volley manager — orchestrates automated AI-vs-AI debates.
+//
+// INTERFACE CONTRACT (do not change exports):
+//   new VolleyManager({ maxRounds, liveAgent, reviewerAgent, focusHint })
+//     .run(store, workdir, primarySession, ws, safeSend, startFromRound?, prevOutput?, priorRounds?)
+//       → Promise<void>  — resolves when debate + synthesis complete or user stops
+//     .stop()            — gracefully stop the current volley
+//
+// Round flow:
+//   Even rounds (0, 2, 4…) → fresh reviewer session (reviewerAgent)
+//   Odd rounds  (1, 3, 5…) → paste into live Panel A session (liveAgent)
+//   After all rounds       → fresh synthesis session (liveAgent)
+//
+// End-of-round detection:
+//   Tier 1 (primary): real-time VERDICT scan — ends round immediately
+//   Tier 2 (fallback): 5-minute silence timeout
+
+const fs     = require('fs')
+const path   = require('path')
+const crypto = require('crypto')
+const { EventEmitter } = require('events')
+const { launchReviewer } = require('../launcher/reviewer')
+const logger = require('../observability/logger')
+
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000   // 5 minutes — fallback only
+const HARD_MAX_ROUNDS = 20
+const VERDICT_RE      = /VERDICT:\s*(CONVERGED|DIVERGED)/i
+
+class VolleyManager extends EventEmitter {
+  constructor({ maxRounds = 3, liveAgent = 'claude', reviewerAgent = 'codex', focusHint = '' } = {}) {
+    super()
+    this.maxRounds     = Math.min(Math.max(1, maxRounds), HARD_MAX_ROUNDS)
+    this.liveAgent     = liveAgent       // the agent in Panel A (participates live)
+    this.reviewerAgent = reviewerAgent   // the fresh-session reviewer
+    this.focusHint     = focusHint
+    this.stopped       = false
+    this._currentSession = null
+  }
+
+  // priorRounds: pass when resuming after volley-continue, so debate history is intact
+  async run(store, workdir, primarySession, ws, safeSend, startFromRound = 0, prevOutput = null, priorRounds = []) {
+    const completedRounds = [...priorRounds]  // seed with prior rounds if resuming
+
+    // Hoist taskPrompt so it's available for volley-log.md writes inside the loop
+    // and for the synthesis section below
+    let taskPrompt = ''
+    try {
+      const taskEvents = (store.export ? store.export().events || [] : []).filter(e => e.type === 'task')
+      taskPrompt = taskEvents.length ? taskEvents[0].prompt : ''
+    } catch (_) {}
+
+    for (let round = startFromRound; round < this.maxRounds && !this.stopped; round++) {
+      const isReviewerTurn = round % 2 === 0   // reviewer always goes first
+
+      if (isReviewerTurn) {
+        // ── Fresh reviewer session ────────────────────────────────────────
+        const roundSessionId = crypto.randomUUID()
+        safeSend(ws, {
+          type: 'ready', sessionId: roundSessionId, agent: this.reviewerAgent,
+          workdir, role: 'volley-round', round, maxRounds: this.maxRounds,
+        })
+        safeSend(ws, {
+          type: 'volley-round-start', round, agent: this.reviewerAgent, maxRounds: this.maxRounds,
+        })
+
+        // Build FULL debate history so every reviewer sees all prior rounds
+        const debateHistory = completedRounds.length > 0
+          ? completedRounds.map((r, i) => {
+              const cap  = 4000
+              const body = r.output && r.output.length > cap
+                ? '[...truncated...]\n' + r.output.slice(-cap)
+                : (r.output || '')
+              return `=== Round ${i + 1} — ${String(r.agent || 'unknown').toUpperCase()} ===\n${body}`
+            }).join('\n\n')
+          : null
+
+        let session
+        try {
+          session = launchReviewer(
+            store, this.reviewerAgent, workdir, debateHistory, null,
+            { focusHint: this.focusHint, primaryAgent: this.liveAgent }
+          )
+        } catch (err) {
+          safeSend(ws, { type: 'volley-error', error: err.message, round })
+          break
+        }
+        this._currentSession = session
+        session.on('data', evt => safeSend(ws, {
+          type: 'output', sessionId: roundSessionId, data: evt.raw != null ? evt.raw : evt,
+        }))
+
+        prevOutput = await this._runRound(session)
+        this._currentSession = null
+
+      } else {
+        // ── Live Panel A agent ────────────────────────────────────────────
+        safeSend(ws, {
+          type: 'volley-round-start', round, agent: this.liveAgent, maxRounds: this.maxRounds,
+        })
+
+        const MAX_PASTE = 20000
+        const body = (prevOutput || '').length > MAX_PASTE
+          ? '[...truncated...]\n\n' + prevOutput.slice(-MAX_PASTE)
+          : (prevOutput || '')
+        primarySession.write(
+          `\r\n\r\n=== REVIEW FROM ${this.reviewerAgent.toUpperCase()} — Round ${round + 1} of ${this.maxRounds} ===\r\n` +
+          body +
+          `\r\n=== END REVIEW ===\r\n` +
+          `Please respond to this review. Address specific disagreements.\r\n` +
+          `End your response with: VERDICT: CONVERGED or VERDICT: DIVERGED\r\n\r`
+        )
+        prevOutput = await this._runLiveRound(primarySession)
+      }
+
+      completedRounds.push({
+        round,
+        agent: isReviewerTurn ? this.reviewerAgent : this.liveAgent,
+        output: prevOutput,
+      })
+
+      // Persist round to store
+      try {
+        store.append('volley-round', {
+          ts: Date.now(), round,
+          agent: isReviewerTurn ? this.reviewerAgent : this.liveAgent,
+          output: prevOutput,
+        })
+      } catch (_) {}
+
+      safeSend(ws, {
+        type: 'volley-round-complete',
+        round,
+        agent: isReviewerTurn ? this.reviewerAgent : this.liveAgent,
+        output: (prevOutput || '').slice(0, 500),
+      })
+
+      // Write human-readable live log to workdir after every round
+      try {
+        const logLines = ['# Volley Log', `Task: ${taskPrompt || '(no task set)'}`, '']
+        completedRounds.forEach((r, i) => {
+          logLines.push(`## Round ${i + 1} — ${String(r.agent || 'unknown').toUpperCase()}`)
+          logLines.push(r.output || '')
+          logLines.push('')
+        })
+        fs.writeFileSync(path.join(workdir, 'volley-log.md'), logLines.join('\n'), 'utf8')
+      } catch (_) {}   // non-fatal — never crash the volley over a log write
+
+      // Convergence check after each complete reviewer+live pair
+      if (round % 2 === 1 && completedRounds.length >= 2) {
+        const last2       = completedRounds.slice(-2)
+        const bothConverged = last2.every(r => {
+          const m = VERDICT_RE.exec(r.output || '')
+          return m && m[1].toUpperCase() === 'CONVERGED'
+        })
+        if (bothConverged) {
+          safeSend(ws, { type: 'volley-convergence', message: 'Both agents agree — running final synthesis' })
+          break
+        }
+      }
+    }
+
+    if (this.stopped) {
+      safeSend(ws, { type: 'volley-done', rounds: completedRounds.length, reason: 'stopped' })
+      this.emit('done', { reason: 'stopped', completedRounds, finalOutput: prevOutput })
+      return
+    }
+
+    // Determine reason and synthesis mode
+    const hitLimit  = completedRounds.length >= this.maxRounds
+    const synthMode = hitLimit ? 'where-things-left-off' : 'full'
+
+    // ── Final synthesis (always runs unless user stopped) ─────────────────
+    safeSend(ws, { type: 'volley-synthesis-start', mode: synthMode })
+
+    const synthSessionId = crypto.randomUUID()
+    // Use liveAgent for synthesis — it has the most familiarity with the codebase
+    const synthAgent = this.liveAgent
+    safeSend(ws, {
+      type: 'ready', sessionId: synthSessionId, agent: synthAgent,
+      workdir, role: 'volley-synthesis',
+    })
+
+    let synthPrompt = store.buildSynthesisPrompt(completedRounds, taskPrompt)
+    if (hitLimit) {
+      synthPrompt =
+        '> NOTE: The round limit was reached without full convergence.\n' +
+        '> Summarize the current state of disagreement and the strongest argument from each side ' +
+        'before giving your synthesis.\n\n' +
+        synthPrompt
+    }
+
+    let synthSession
+    try {
+      synthSession = launchReviewer(store, synthAgent, workdir, null, synthPrompt)
+    } catch (err) {
+      logger.error({ err }, 'volley: synthesis launch failed')
+      safeSend(ws, { type: 'volley-done', rounds: completedRounds.length, reason: 'synthesis-error' })
+      this.emit('done', { reason: 'synthesis-error', completedRounds, finalOutput: prevOutput })
+      return
+    }
+
+    // Track synthesis session so stop() / browser-close kills it cleanly
+    this._currentSession = synthSession
+    synthSession.on('data', evt => safeSend(ws, {
+      type: 'output', sessionId: synthSessionId, data: evt.raw != null ? evt.raw : evt,
+    }))
+    const synthOutput = await this._runRound(synthSession)
+    this._currentSession = null
+
+    // Persist synthesis round
+    try {
+      store.append('volley-round', {
+        ts: Date.now(), round: completedRounds.length,
+        agent: 'synthesis', role: 'synthesis', output: synthOutput,
+      })
+    } catch (_) {}
+
+    const reason = hitLimit ? 'round-limit' : 'converged'
+    safeSend(ws, {
+      type: 'volley-done',
+      rounds: completedRounds.length,
+      reason,
+      canContinue: hitLimit,      // tells browser to show Continue button
+      synthOutput: (synthOutput || '').slice(0, 1000),
+    })
+    this.emit('done', { reason, completedRounds, finalOutput: synthOutput })
+  }
+
+  // Used for both fresh reviewer sessions AND the synthesis session.
+  // Resolves with the clean text output of the session.
+  _runRound(session) {
+    return new Promise(resolve => {
+      let timer   = null
+      let settled = false
+      const accum = []
+
+      const settle = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(session.capturedOutput || stripAnsi(accum.join('')))
+      }
+
+      const resetTimer = () => {
+        clearTimeout(timer)
+        timer = setTimeout(() => {
+          logger.warn({ pid: session.pid }, 'volley: 5-min idle timeout — ending round')
+          try { session.kill() } catch (_) {}
+        }, IDLE_TIMEOUT_MS)
+      }
+
+      session.on('data', evt => {
+        const chunk = evt.raw != null ? evt.raw : String(evt)
+        accum.push(chunk)
+        // Real-time VERDICT scan — end round immediately when found
+        if (VERDICT_RE.test(chunk)) {
+          logger.debug('volley: VERDICT detected in reviewer stream — ending round')
+          // Small grace period so the model can finish the line it's on
+          setTimeout(() => { try { session.kill() } catch (_) {} }, 500)
+        }
+        resetTimer()
+      })
+
+      session.once('exit', settle)
+      resetTimer()
+    })
+  }
+
+  // Used for live Panel A turns.
+  // Listens on primarySession for output after the paste, resolves when VERDICT found or idle.
+  _runLiveRound(primarySession) {
+    return new Promise(resolve => {
+      const buf   = []
+      let timer   = null
+      let settled = false
+
+      const finish = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        primarySession.removeListener('data', dataListener)
+        const raw = buf.join('')
+        resolve(stripAnsi(raw))
+      }
+
+      const dataListener = evt => {
+        const chunk = evt.raw != null ? evt.raw : String(evt)
+        buf.push(chunk)
+        if (VERDICT_RE.test(chunk)) {
+          logger.debug('volley: VERDICT detected in live Panel A stream — ending round')
+          setTimeout(finish, 500)  // grace period for the model to finish the line
+          return
+        }
+        clearTimeout(timer)
+        timer = setTimeout(finish, IDLE_TIMEOUT_MS)
+      }
+
+      primarySession.on('data', dataListener)
+      timer = setTimeout(finish, IDLE_TIMEOUT_MS)
+    })
+  }
+
+  stop() {
+    this.stopped = true
+    try { if (this._currentSession) this._currentSession.kill() } catch (_) {}
+  }
+}
+
+// Inline stripAnsi for captured output — avoids a cross-module dependency
+const _ANSI_RE = new RegExp(
+  '\\x1b(?:' +
+  '\\[[0-9;?]*[A-Za-z~]' +
+  '|\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\)' +
+  '|P[^\\x1b]*(?:\\x1b\\\\|$)' +
+  '|[^[\\]P]' +
+  ')',
+  'g'
+)
+
+function stripAnsi(str) {
+  return String(str)
+    .replace(_ANSI_RE, '')
+    .replace(/[^\x20-\x7E\n\r\t]/g, '')
+    .replace(/\r\n|\r/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+module.exports = { VolleyManager }

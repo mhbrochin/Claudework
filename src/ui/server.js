@@ -20,6 +20,7 @@ const crypto = require('crypto')
 const { execSync } = require('child_process')
 const express = require('express')
 const { WebSocketServer } = require('ws')
+const { listSessions } = require('../db/sessions-repo')
 
 function startServer({ store, createSession, launchReviewer, port = 3000 }) {
   const app = express()
@@ -30,6 +31,14 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
     const target = entry && entry.store ? entry.store : store
     try {
       res.json(target.export())
+    } catch (err) {
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  app.get('/api/sessions', (req, res) => {
+    try {
+      res.json(listSessions())
     } catch (err) {
       res.status(500).json({ error: err.message })
     }

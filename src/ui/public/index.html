@@ -3,28 +3,393 @@
 <head>
   <meta charset="UTF-8" />
   <title>ContextBridge</title>
-  <!--
-    UI CONTRACT — implement in feature/web-ui:
-
-    Layout (three panels):
-      TOP LEFT  — Session A terminal (xterm.js), label shows agent name
-      TOP RIGHT — Session B terminal (xterm.js), initially blank until reviewer launched
-      BOTTOM    — Context log panel: live scrolling event feed from the active session
-
-    Toolbar buttons:
-      [ New Session ]     — opens modal: pick agent (claude/codex), set workdir
-      [ Flag Decision ]   — prompts for a note, sends { type:'flag' } to server
-      [ Send to Reviewer ]— picks reviewer agent, sends { type:'review' } to server
-                            → Session B panel activates with the reviewer session
-      [ Export Context ]  — downloads session JSON from /api/sessions/:id/export
-
-    xterm.js CDN:
-      https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css
-      https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js
-      https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js
-  -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      flex: 0 0 auto;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 600;
+      margin-right: 12px;
+      letter-spacing: 0.5px;
+    }
+    button {
+      background: #21262d;
+      color: #e6edf3;
+      border: 1px solid #30363d;
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    button:hover:not(:disabled) { background: #30363d; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    main {
+      flex: 1 1 auto;
+      display: grid;
+      grid-template-rows: 2fr 1fr;
+      min-height: 0;
+    }
+    #terminals {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1px;
+      background: #30363d;
+      min-height: 0;
+    }
+    #terminals.single { grid-template-columns: 1fr; }
+    .panel {
+      background: #0d1117;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+    }
+    .panel-header {
+      padding: 4px 10px;
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: #8b949e;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex: 0 0 auto;
+    }
+    .panel-header .label-tag {
+      color: #58a6ff;
+      font-weight: 600;
+    }
+    .panel-header .agent-tag {
+      color: #f0883e;
+      font-size: 10px;
+    }
+    .active { color: #3fb950; }
+    .term {
+      flex: 1 1 auto;
+      min-height: 0;
+      padding: 4px;
+      background: #0d1117;
+    }
+    #panelB.hidden { display: none; }
+    #log {
+      background: #0d1117;
+      border-top: 1px solid #30363d;
+      overflow: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+      padding: 8px 12px;
+      min-height: 0;
+    }
+    #log .entry { padding: 2px 0; border-bottom: 1px solid #161b22; white-space: pre-wrap; word-break: break-word; }
+    #log .ts { color: #6e7681; margin-right: 8px; }
+    #log .tag { font-weight: 600; margin-right: 6px; }
+    #log .tag.flag { color: #f0883e; }
+    #log .tag.diff { color: #3fb950; }
+    #log .tag.ready { color: #58a6ff; }
+    #log .tag.exit { color: #f85149; }
+    #log .tag.info { color: #8b949e; }
+    .modal-backdrop {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.6);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 100;
+    }
+    .modal {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 20px;
+      min-width: 360px;
+    }
+    .modal h2 { margin: 0 0 12px; font-size: 14px; }
+    .modal label { display: block; font-size: 12px; margin-top: 10px; color: #8b949e; }
+    .modal input, .modal select {
+      width: 100%; padding: 6px 8px; margin-top: 4px;
+      background: #0d1117; color: #e6edf3;
+      border: 1px solid #30363d; border-radius: 4px; font-size: 13px;
+    }
+    .modal-actions {
+      display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px;
+    }
+    .hidden { display: none !important; }
+  </style>
 </head>
 <body>
-  <p>ContextBridge UI — not yet implemented (see feature/web-ui)</p>
+  <header>
+    <h1>ContextBridge</h1>
+    <button id="btnNew">New Session</button>
+    <button id="btnFlag" disabled>Flag Decision</button>
+    <button id="btnReview" disabled>Send to Reviewer</button>
+    <button id="btnExport" disabled>Export Context</button>
+    <span style="flex:1"></span>
+    <span id="status" style="font-size:11px; color:#8b949e;">disconnected</span>
+  </header>
+
+  <main>
+    <div id="terminals" class="single">
+      <section class="panel" id="panelA">
+        <div class="panel-header">
+          <span><span class="label-tag">Session A</span> <span class="agent-tag" id="agentA">—</span></span>
+          <span id="statusA">idle</span>
+        </div>
+        <div class="term" id="termA"></div>
+      </section>
+      <section class="panel hidden" id="panelB">
+        <div class="panel-header">
+          <span><span class="label-tag">Session B (Reviewer)</span> <span class="agent-tag" id="agentB">—</span></span>
+          <span id="statusB">idle</span>
+        </div>
+        <div class="term" id="termB"></div>
+      </section>
+    </div>
+    <div id="log"></div>
+  </main>
+
+  <div id="newModal" class="modal-backdrop hidden">
+    <div class="modal">
+      <h2>New Session</h2>
+      <label>Agent
+        <select id="newAgent">
+          <option value="claude">claude</option>
+          <option value="codex">codex</option>
+        </select>
+      </label>
+      <label>Workdir
+        <input id="newWorkdir" type="text" value="." />
+      </label>
+      <div class="modal-actions">
+        <button id="newCancel">Cancel</button>
+        <button id="newStart">Start</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="reviewModal" class="modal-backdrop hidden">
+    <div class="modal">
+      <h2>Send to Reviewer</h2>
+      <label>Reviewer agent
+        <select id="reviewAgent">
+          <option value="codex">codex</option>
+          <option value="claude">claude</option>
+        </select>
+      </label>
+      <div class="modal-actions">
+        <button id="reviewCancel">Cancel</button>
+        <button id="reviewGo">Launch</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const { Terminal } = window
+    const FitAddon = window.FitAddon.FitAddon
+
+    const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const ws = new WebSocket(`${wsProto}//${location.host}`)
+
+    const statusEl = document.getElementById('status')
+    const logEl = document.getElementById('log')
+    const terminalsEl = document.getElementById('terminals')
+    const panelB = document.getElementById('panelB')
+
+    const panels = {
+      A: makePanel('termA', 'statusA', 'agentA'),
+      B: makePanel('termB', 'statusB', 'agentB'),
+    }
+
+    let primarySessionId = null
+    let reviewerSessionId = null
+    const sessionToPanel = new Map()
+    const sessionMeta = new Map()
+
+    function makePanel(termId, statusId, agentId) {
+      const term = new Terminal({
+        convertEol: true,
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: 12,
+        theme: { background: '#0d1117', foreground: '#e6edf3' },
+      })
+      const fit = new FitAddon()
+      term.loadAddon(fit)
+      term.open(document.getElementById(termId))
+      try { fit.fit() } catch (_) {}
+      return {
+        term, fit,
+        statusEl: document.getElementById(statusId),
+        agentEl: document.getElementById(agentId),
+        sessionId: null,
+      }
+    }
+
+    window.addEventListener('resize', () => {
+      try { panels.A.fit.fit() } catch (_) {}
+      try { panels.B.fit.fit() } catch (_) {}
+    })
+
+    function log(tag, text) {
+      const entry = document.createElement('div')
+      entry.className = 'entry'
+      const ts = new Date().toLocaleTimeString()
+      entry.innerHTML = `<span class="ts">${ts}</span><span class="tag ${tag}">[${tag}]</span>${escapeHtml(text)}`
+      logEl.appendChild(entry)
+      logEl.scrollTop = logEl.scrollHeight
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
+    }
+
+    function send(msg) {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
+    }
+
+    function setActiveSession(panelKey, sessionId, agent) {
+      const panel = panels[panelKey]
+      panel.sessionId = sessionId
+      panel.statusEl.textContent = 'live'
+      panel.statusEl.classList.add('active')
+      panel.agentEl.textContent = agent || ''
+      sessionToPanel.set(sessionId, panelKey)
+      sessionMeta.set(sessionId, { agent, panelKey })
+
+      panel.term.onData((data) => {
+        if (!panel.sessionId) return
+        send({ type: 'input', sessionId: panel.sessionId, data })
+      })
+    }
+
+    function showReviewerPanel() {
+      panelB.classList.remove('hidden')
+      terminalsEl.classList.remove('single')
+      try { panels.A.fit.fit() } catch (_) {}
+      try { panels.B.fit.fit() } catch (_) {}
+    }
+
+    ws.addEventListener('open', () => {
+      statusEl.textContent = 'connected'
+      log('info', 'WebSocket connected')
+    })
+    ws.addEventListener('close', () => {
+      statusEl.textContent = 'disconnected'
+      log('info', 'WebSocket closed')
+      document.getElementById('btnFlag').disabled = true
+      document.getElementById('btnReview').disabled = true
+      document.getElementById('btnExport').disabled = true
+    })
+
+    ws.addEventListener('message', (ev) => {
+      let msg
+      try { msg = JSON.parse(ev.data) } catch (_) { return }
+      const panelKey = sessionToPanel.get(msg.sessionId)
+      const panel = panelKey ? panels[panelKey] : null
+
+      if (msg.type === 'ready') {
+        if (msg.role === 'reviewer') {
+          reviewerSessionId = msg.sessionId
+          showReviewerPanel()
+          setActiveSession('B', msg.sessionId, msg.agent)
+          log('ready', `Reviewer session ready (${msg.agent}) — ${msg.sessionId}`)
+        } else {
+          primarySessionId = msg.sessionId
+          setActiveSession('A', msg.sessionId, msg.agent)
+          log('ready', `Session A ready (${msg.agent}) — ${msg.sessionId}`)
+          document.getElementById('btnFlag').disabled = false
+          document.getElementById('btnReview').disabled = false
+          document.getElementById('btnExport').disabled = false
+        }
+      } else if (msg.type === 'output') {
+        if (panel) panel.term.write(msg.data)
+      } else if (msg.type === 'diff') {
+        log('diff', `${msg.file}\n${msg.patch || ''}`)
+      } else if (msg.type === 'exit') {
+        log('exit', `session ${msg.sessionId} exited (code ${msg.code})`)
+        if (panel) {
+          panel.statusEl.textContent = `exited (${msg.code})`
+          panel.statusEl.classList.remove('active')
+        }
+      }
+    })
+
+    // Toolbar handlers
+    document.getElementById('btnNew').addEventListener('click', () => {
+      document.getElementById('newModal').classList.remove('hidden')
+    })
+    document.getElementById('newCancel').addEventListener('click', () => {
+      document.getElementById('newModal').classList.add('hidden')
+    })
+    document.getElementById('newStart').addEventListener('click', () => {
+      const agent = document.getElementById('newAgent').value
+      const workdir = document.getElementById('newWorkdir').value || '.'
+      send({ type: 'start', agent, workdir })
+      document.getElementById('newModal').classList.add('hidden')
+      log('info', `Requesting new ${agent} session in ${workdir}`)
+    })
+
+    document.getElementById('btnFlag').addEventListener('click', () => {
+      if (!primarySessionId) return
+      const note = window.prompt('Flag note — explain the decision:')
+      if (note && note.trim()) {
+        send({ type: 'flag', sessionId: primarySessionId, note })
+        log('flag', note)
+      }
+    })
+
+    document.getElementById('btnReview').addEventListener('click', () => {
+      if (!primarySessionId) return
+      document.getElementById('reviewModal').classList.remove('hidden')
+    })
+    document.getElementById('reviewCancel').addEventListener('click', () => {
+      document.getElementById('reviewModal').classList.add('hidden')
+    })
+    document.getElementById('reviewGo').addEventListener('click', () => {
+      const reviewerAgent = document.getElementById('reviewAgent').value
+      send({ type: 'review', sessionId: primarySessionId, reviewerAgent })
+      document.getElementById('reviewModal').classList.add('hidden')
+      log('info', `Launching ${reviewerAgent} reviewer`)
+    })
+
+    document.getElementById('btnExport').addEventListener('click', async () => {
+      const id = primarySessionId
+      if (!id) return
+      try {
+        const res = await fetch(`/api/sessions/${id}/export`)
+        const data = await res.json()
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `session-${id}.json`
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        URL.revokeObjectURL(url)
+        log('info', `Exported context for ${id}`)
+      } catch (err) {
+        log('exit', `Export failed: ${err.message}`)
+      }
+    })
+  </script>
 </body>
 </html>

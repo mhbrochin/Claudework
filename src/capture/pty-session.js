@@ -20,11 +20,11 @@ function createSession(command, workdir, sessionId) {
   session.sessionId = sessionId
   session.workdir = workdir
 
-  const parts = command.trim().split(/\s+/)
-  const file = parts[0]
-  const args = parts.slice(1)
+  // Spawn through the user's login shell so PATH includes wherever claude/codex
+  // are installed (especially on macOS where GUI apps get a limited PATH).
+  const loginShell = process.env.SHELL || '/bin/bash'
 
-  const shell = pty.spawn(file, args, {
+  const shell = pty.spawn(loginShell, ['-lc', command], {
     name: 'xterm-256color',
     cols: 120,
     rows: 30,

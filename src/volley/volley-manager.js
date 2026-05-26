@@ -302,21 +302,33 @@ class VolleyManager extends EventEmitter {
       // VERDICT regex would fire on the *echo* of the injected prompt (before the model has
       // produced any output) — ending the round in ~2.5 seconds with empty output.
       // Fix: enable VERDICT scanning only after verdictCooldownMs (default 3.5s = 2s injection + 1.5s buffer).
+      // Critically, we ALSO reset tailBuf when verdictEnabled flips — otherwise the echoed
+      // prompt text accumulated during the cooldown window stays in the rolling buffer and
+      // the very next post-cooldown byte trips the regex against echo content.
       // Unit tests pass verdictCooldownMs=0 since they have no PTY echo.
-      setTimeout(() => { verdictEnabled = true }, this.verdictCooldownMs)
+      setTimeout(() => {
+        verdictEnabled = true
+        tailBuf = ''   // discard echo-contaminated buffer
+      }, this.verdictCooldownMs)
 
       // Rolling tail of STRIPPED output for VERDICT scanning.
       // Testing raw chunks fails when the AI CLI wraps VERDICT in cursor-positioning
       // sequences (e.g. \x1b[1G\x1b[K before the text) — \s* in VERDICT_RE won't
       // skip those bytes.  A 500-char stripped tail also catches VERDICT split across
       // PTY chunk boundaries.
+      //
+      // IMPORTANT: use stripAnsiForScan (no .trim()) here — the trimming variant
+      // strips the trailing \n of every chunk, so a verdict that arrives as
+      // "Analysis.\n" + "VERDICT: CONVERGED\n" would lose the \n separator and the
+      // "(?:^|\n)\s*VERDICT:" regex would never match. Output capture still uses
+      // the trimming stripAnsi() — only the scan buffer needs end preservation.
       let tailBuf      = ''
       let verdictFired = false
 
       session.on('data', evt => {
         const chunk = evt.raw != null ? evt.raw : String(evt)
         accum.push(chunk)
-        tailBuf = (tailBuf + stripAnsi(chunk)).slice(-500)
+        tailBuf = (tailBuf + stripAnsiForScan(chunk)).slice(-500)
         // Real-time VERDICT scan — end round immediately when found.
         // verdictEnabled guard ensures we only react to the model's own output, not the
         // echoed prompt text that was typed into the PTY during the injection window.
@@ -361,18 +373,22 @@ class VolleyManager extends EventEmitter {
       // "VERDICT: CONVERGED or VERDICT: DIVERGED".  The PTY echoes this back immediately.
       // Without a cooldown, VERDICT detection fires on the echo rather than Claude's response.
       // liveCooldownMs (default 1.5s) is enough for the paste echo to clear.
+      // ALSO reset tailBuf when cooldown lifts — see equivalent comment in _runRound.
       // Unit tests pass liveCooldownMs=0 since they have no PTY echo.
-      setTimeout(() => { verdictEnabled = true }, this.liveCooldownMs)
+      setTimeout(() => {
+        verdictEnabled = true
+        tailBuf = ''   // discard paste-echo contamination
+      }, this.liveCooldownMs)
 
-      // Same rolling-tail approach as _runRound — ANSI sequences and chunk boundaries
-      // can prevent a raw-chunk VERDICT_RE match.
+      // Same rolling-tail approach as _runRound — uses stripAnsiForScan (no trim)
+      // so chunk-boundary newlines are preserved for the VERDICT regex.
       let tailBuf      = ''
       let verdictFired = false
 
       const dataListener = evt => {
         const chunk = evt.raw != null ? evt.raw : String(evt)
         buf.push(chunk)
-        tailBuf = (tailBuf + stripAnsi(chunk)).slice(-500)
+        tailBuf = (tailBuf + stripAnsiForScan(chunk)).slice(-500)
         if (verdictEnabled && !verdictFired && VERDICT_RE.test(tailBuf)) {
           verdictFired = true
           logger.debug('volley: VERDICT detected in live Panel A stream — ending round')
@@ -412,6 +428,16 @@ function stripAnsi(str) {
     .replace(/\r\n|\r/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+}
+
+// Variant for rolling-tail VERDICT scanning: same cleanup as stripAnsi() but
+// WITHOUT .trim(), so chunk-boundary \n are preserved. Trimming each chunk
+// destroys the line break the VERDICT regex needs.
+function stripAnsiForScan(str) {
+  return String(str)
+    .replace(_ANSI_RE, '')
+    .replace(/[^\x20-\x7E\n\r\t]/g, '')
+    .replace(/\r\n|\r/g, '\n')
 }
 
 module.exports = { VolleyManager }

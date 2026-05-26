@@ -85,6 +85,9 @@ function makeSafeSend() {
 
 const WS_MOCK = {}   // ws arg is only forwarded to safeSend — not used by VolleyManager directly
 
+/** Default no-op registerSession mock — keeps tests clean unless we're testing registration. */
+const noopRegister = jest.fn()
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 beforeEach(() => jest.clearAllMocks())
@@ -303,6 +306,34 @@ test('13. round 2 reviewer receives full debate history (rounds 0 and 1)', async
   const [, , , debateHistory2] = launchReviewer.mock.calls[1]
   expect(debateHistory2).toContain('=== Round 1 — CODEX ===')
   expect(debateHistory2).toContain('=== Round 2 — CLAUDE ===')
+}, 15000)
+
+// ─── Test 15 — registerSession called for round and synthesis sessions ─────────
+test('15. registerSession is called for each reviewer round + synthesis session', async () => {
+  launchReviewer
+    .mockImplementationOnce(() => mockSession({ verdict: 'DIVERGED' }))  // round 0
+    .mockImplementationOnce(() => mockSession({ verdict: 'DIVERGED' }))  // synthesis
+
+  const primarySession = mockPrimarySession({ verdict: 'DIVERGED' })
+  const safeSend       = makeSafeSend()
+  const registerSession = jest.fn()
+
+  const vm = new VolleyManager({
+    maxRounds: 1, liveAgent: 'claude', reviewerAgent: 'codex', registerSession,
+  })
+  await vm.run(mockStore(), '/workdir', primarySession, WS_MOCK, safeSend)
+
+  // Should have been called twice: once for round 0 reviewer, once for synthesis
+  expect(registerSession).toHaveBeenCalledTimes(2)
+  // Both calls should include a string session ID and an EventEmitter (session)
+  for (const [id, session, agent] of registerSession.mock.calls) {
+    expect(typeof id).toBe('string')
+    expect(id.length).toBeGreaterThan(0)
+    expect(session).toBeTruthy()
+  }
+  // Second call should be the synthesis agent (liveAgent = 'claude')
+  const [, , synthAgent] = registerSession.mock.calls[1]
+  expect(synthAgent).toBe('claude')
 }, 15000)
 
 // ─── Test 14 — synthesis session tracked in _currentSession ──────────────────

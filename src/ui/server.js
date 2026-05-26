@@ -463,15 +463,19 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
 
       // ── volley-start ─────────────────────────────────────────────────────
       if (msg.type === 'volley-start') {
+        logger.info({ sessionId: msg.sessionId, maxRounds: msg.maxRounds }, 'volley-start received')
         if (!VolleyManagerSafe) {
+          logger.error('VolleyManager not loaded')
           safeSend(ws, { type: 'volley-error', error: 'VolleyManager not available — check server logs' })
           return
         }
         if (activeVolley) {
+          logger.warn('volley already running')
           safeSend(ws, { type: 'volley-error', error: 'A volley is already running' })
           return
         }
         const sourceEntry = sessions.get(msg.sessionId)
+        logger.info({ found: !!sourceEntry, knownSessions: [...sessions.keys()] }, 'volley session lookup')
         if (!sourceEntry) {
           safeSend(ws, { type: 'volley-error', error: 'Session not found' })
           return
@@ -483,9 +487,28 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         const maxRounds     = Number.isInteger(msg.maxRounds) && msg.maxRounds >= 1
           ? Math.min(msg.maxRounds, 20) : 3
 
+        // BUG 1 FIX: safeSendVolley resolves the current ws dynamically at send-time.
+        // If the browser disconnects and reconnects, the session entry's ws is updated by
+        // the reconnect handler — this closure always uses the live socket, not a stale capture.
+        const volleyPrimaryId = msg.sessionId
+        const safeSendVolley  = (_ws, message) => {
+          const e = sessions.get(volleyPrimaryId)
+          safeSend((e && e.ws) || _ws, message)
+        }
+
         activeVolley = new VolleyManagerSafe({
           liveAgent, reviewerAgent, maxRounds, focusHint: msg.focusHint || '',
           cols: msg.cols, rows: msg.rows,
+          // BUG 2 FIX: register each round/synthesis session in the sessions Map so
+          //   resize messages from the browser reach the PTY and grace-kill applies.
+          registerSession: (id, session, agent) => {
+            sessions.set(id, {
+              session, store: sourceEntry.store, agent,
+              workdir: sourceEntry.workdir || process.cwd(),
+              ws: null, killTimer: null,
+            })
+            ownedSessions.add(id)
+          },
         })
         activeVolley.once('done', ({ finalOutput }) => {
           if (finalOutput) capturedOutputs.set('volley-final', finalOutput)
@@ -493,10 +516,10 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         })
         activeVolley.run(
           sourceEntry.store, sourceEntry.workdir || process.cwd(),
-          sourceEntry.session, ws, safeSend
+          sourceEntry.session, ws, safeSendVolley
         ).catch(err => {
           logger.error({ err }, 'volley: run() threw unexpectedly')
-          safeSend(ws, { type: 'volley-error', error: err.message })
+          safeSendVolley(ws, { type: 'volley-error', error: err.message })
           activeVolley = null
         })
         return
@@ -541,11 +564,27 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         const liveAgent     = sourceEntry.agent || 'claude'
         const reviewerAgent = liveAgent === 'claude' ? 'codex' : 'claude'
 
+        // BUG 1 FIX (same as volley-start): dynamic ws resolution so reconnects work
+        const continueId     = msg.sessionId
+        const safeSendContinue = (_ws, message) => {
+          const e = sessions.get(continueId)
+          safeSend((e && e.ws) || _ws, message)
+        }
+
         activeVolley = new VolleyManagerSafe({
           liveAgent, reviewerAgent,
           maxRounds:  startFromRound + extraRounds,
           focusHint:  msg.focusHint || '',
           cols: msg.cols, rows: msg.rows,
+          // BUG 2 FIX: register sessions for continued volleys too
+          registerSession: (id, session, agent) => {
+            sessions.set(id, {
+              session, store: sourceEntry.store, agent,
+              workdir: sourceEntry.workdir || process.cwd(),
+              ws: null, killTimer: null,
+            })
+            ownedSessions.add(id)
+          },
         })
         activeVolley.once('done', ({ finalOutput }) => {
           if (finalOutput) capturedOutputs.set('volley-final', finalOutput)
@@ -553,11 +592,11 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         })
         activeVolley.run(
           sourceEntry.store, sourceEntry.workdir || process.cwd(),
-          sourceEntry.session, ws, safeSend,
+          sourceEntry.session, ws, safeSendContinue,
           startFromRound, prevOutput, completedRounds
         ).catch(err => {
           logger.error({ err }, 'volley: continue() threw unexpectedly')
-          safeSend(ws, { type: 'volley-error', error: err.message })
+          safeSendContinue(ws, { type: 'volley-error', error: err.message })
           activeVolley = null
         })
         return

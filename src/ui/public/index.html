@@ -272,7 +272,37 @@
     const FitAddon = window.FitAddon.FitAddon
 
     const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const ws = new WebSocket(`${wsProto}//${location.host}`)
+
+    // Auto-reconnecting WebSocket wrapper.
+    // If the server restarts or the connection drops, we retry every 2s (up to 30 attempts).
+    // All event listeners use the same stable `ws` proxy object so nothing else needs to change.
+    let _wsRaw = null
+    let _wsReconnectTimer = null
+    let _wsReconnectAttempts = 0
+    const MAX_RECONNECT = 30
+
+    const ws = {
+      _listeners: { open: [], close: [], message: [], error: [] },
+      addEventListener(evt, fn) { this._listeners[evt] = this._listeners[evt] || []; this._listeners[evt].push(fn) },
+      send(data) { if (_wsRaw && _wsRaw.readyState === 1) _wsRaw.send(data) },
+      get readyState() { return _wsRaw ? _wsRaw.readyState : 3 },
+    }
+
+    function wsConnect() {
+      if (_wsRaw) { try { _wsRaw.onopen = _wsRaw.onclose = _wsRaw.onmessage = _wsRaw.onerror = null } catch(_) {} }
+      _wsRaw = new WebSocket(`${wsProto}//${location.host}`)
+      _wsRaw.onopen    = (e) => { _wsReconnectAttempts = 0; ws._listeners.open.forEach(fn => fn(e)) }
+      _wsRaw.onclose   = (e) => {
+        ws._listeners.close.forEach(fn => fn(e))
+        if (_wsReconnectAttempts < MAX_RECONNECT) {
+          _wsReconnectAttempts++
+          _wsReconnectTimer = setTimeout(wsConnect, 2000)
+        }
+      }
+      _wsRaw.onmessage = (e) => ws._listeners.message.forEach(fn => fn(e))
+      _wsRaw.onerror   = (e) => ws._listeners.error.forEach(fn => fn(e))
+    }
+    wsConnect()
 
     const statusEl      = document.getElementById('status')
     const logEl         = document.getElementById('log')
@@ -358,7 +388,10 @@
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
     }
 
-    function setActiveSession(panelKey, sessionId, agent) {
+    // skipResize: pass true when showReviewerPanel() already scheduled a fitAndResize via rAF.
+    // Without this, both showReviewerPanel() and setActiveSession() schedule fitAndResize('B'),
+    // resulting in two resize messages for the same panel open — harmless but wasteful.
+    function setActiveSession(panelKey, sessionId, agent, { skipResize = false } = {}) {
       const panel = panels[panelKey]
       panel.sessionId = sessionId
       panel.statusEl.textContent = 'live'
@@ -381,7 +414,8 @@
       // may be a different size. The mismatch causes ANSI escape sequences to land
       // at wrong columns, making output look like garbage ([0 q[0 q...).
       // We fire in a rAF so the panel is fully laid out before we measure it.
-      requestAnimationFrame(() => { fitAndResize(panelKey) })
+      // skipResize=true when the caller (showReviewerPanel) already scheduled this.
+      if (!skipResize) requestAnimationFrame(() => { fitAndResize(panelKey) })
 
       panel.term.focus()
     }
@@ -461,20 +495,27 @@
           reviewerSessionId = msg.sessionId
           const label = role === 'cross-check' ? 'Session B (Cross-Check)' : 'Session B (Reviewer)'
           showReviewerPanel(label, msg.agent)
-          setActiveSession('B', msg.sessionId, msg.agent)
+          // skipResize=true: showReviewerPanel's rAF already handles fitAndResize('B')
+          setActiveSession('B', msg.sessionId, msg.agent, { skipResize: true })
           setTimeout(() => panels.B.term.focus(), 300)
           log('ready', `${role === 'cross-check' ? 'Cross-check' : 'Reviewer'} session ready (${msg.agent}) — ${msg.sessionId}`)
 
         } else if (role === 'volley-round') {
           // Fresh reviewer round — show in Panel B
+          // BUG 4 FIX: keep reviewerSessionId current so "Send to Panel A" works mid-volley
+          reviewerSessionId = msg.sessionId
           showReviewerPanel('Session B (Volley)', msg.agent)
-          setActiveSession('B', msg.sessionId, msg.agent)
+          // skipResize=true: showReviewerPanel's rAF already handles fitAndResize('B')
+          setActiveSession('B', msg.sessionId, msg.agent, { skipResize: true })
           setTimeout(() => panels.B.term.focus(), 300)
+          // BUG 3a FIX: log confirmation so user knows Panel B session connected
+          log('volley', `Round ${(msg.round || 0) + 1} reviewer session live (${msg.agent}) — waiting for prompt injection…`)
 
         } else if (role === 'volley-synthesis') {
           // Synthesis session — show in Panel B
           showReviewerPanel('Session B (Synthesis)', msg.agent)
-          setActiveSession('B', msg.sessionId, msg.agent)
+          // skipResize=true: showReviewerPanel's rAF already handles fitAndResize('B')
+          setActiveSession('B', msg.sessionId, msg.agent, { skipResize: true })
           setTimeout(() => panels.B.term.focus(), 300)
           log('synth', `Synthesis session started (${msg.agent}) — ${msg.sessionId}`)
         }
@@ -496,9 +537,15 @@
 
       // ── reconnect-fail ─────────────────────────────────────────────────
       } else if (msg.type === 'reconnect-fail') {
-        // Session expired before we reconnected — clear saved state
+        // Session expired (server restarted or 60s grace window elapsed) — reset UI
         try { sessionStorage.removeItem('cb_session') } catch (_) {}
-        log('info', `Prior session expired — ${msg.reason}`)
+        primarySessionId = null
+        primaryAgent     = null
+        document.getElementById('btnFlag').disabled        = true
+        document.getElementById('btnReview').disabled      = true
+        document.getElementById('btnVolleyStart').disabled = true
+        document.getElementById('btnExport').disabled      = true
+        log('info', `Prior session expired — start a new session`)
 
       // ── exit ───────────────────────────────────────────────────────────
       } else if (msg.type === 'exit') {
@@ -523,6 +570,11 @@
         // Show Stop Volley button
         document.getElementById('btnVolleyStop').classList.remove('hidden')
         document.getElementById('btnVolleyStart').disabled = true
+
+      } else if (msg.type === 'volley-prompt-sent') {
+        // BUG 3b FIX: confirmation that the 2-second prompt injection completed.
+        // Gives the user a clear signal that the reviewer received the prompt and is analyzing.
+        log('volley', `✓ Prompt delivered to ${msg.agent} — analysis in progress (this may take a few minutes)…`)
 
       } else if (msg.type === 'volley-round-complete') {
         const preview = (msg.output || '').slice(0, 120).replace(/\n/g, ' ')

@@ -29,7 +29,7 @@ const VERDICT_RE      = /VERDICT:\s*(CONVERGED|DIVERGED)/i
 
 class VolleyManager extends EventEmitter {
   constructor({ maxRounds = 3, liveAgent = 'claude', reviewerAgent = 'codex', focusHint = '',
-                cols, rows } = {}) {
+                cols, rows, registerSession } = {}) {
     super()
     this.maxRounds     = Math.min(Math.max(1, maxRounds), HARD_MAX_ROUNDS)
     this.liveAgent     = liveAgent       // the agent in Panel A (participates live)
@@ -39,11 +39,20 @@ class VolleyManager extends EventEmitter {
     // When provided (from browser), initial output renders correctly without waiting for resize.
     this.cols          = cols
     this.rows          = rows
+    // registerSession(id, session, agent) — called after each round/synthesis session is launched.
+    // server.js uses this to insert the session into the sessions Map so resize messages work
+    // and the 60-second grace-kill applies to volley sessions too.
+    this.registerSession = typeof registerSession === 'function' ? registerSession : () => {}
     this.stopped       = false
     this._currentSession = null
   }
 
   // priorRounds: pass when resuming after volley-continue, so debate history is intact
+  //
+  // NOTE on `ws` and `safeSend`:
+  // `ws` is passed through to safeSend for backward-compat, but server.js wraps safeSend into
+  // a closure (safeSendVolley) that dynamically resolves the current WebSocket from the sessions
+  // Map at send-time.  This means output still flows after a browser disconnect+reconnect.
   async run(store, workdir, primarySession, ws, safeSend, startFromRound = 0, prevOutput = null, priorRounds = []) {
     const completedRounds = [...priorRounds]  // seed with prior rounds if resuming
 
@@ -91,10 +100,20 @@ class VolleyManager extends EventEmitter {
           safeSend(ws, { type: 'volley-error', error: err.message, round })
           break
         }
+        // Register this session in server.js's sessions Map so:
+        //   1. resize messages from the browser reach this PTY (fixes garbled output)
+        //   2. the 60-second grace-kill applies when the browser disconnects
+        this.registerSession(roundSessionId, session, this.reviewerAgent)
         this._currentSession = session
         session.on('data', evt => safeSend(ws, {
           type: 'output', sessionId: roundSessionId, data: evt.raw != null ? evt.raw : evt,
         }))
+        // Delayed confirmation — fires after the 2-second prompt-injection window so the browser
+        // can show "Prompt delivered — Codex is analyzing…" without a false positive.
+        const _round = round
+        setTimeout(() => safeSend(ws, {
+          type: 'volley-prompt-sent', round: _round, agent: this.reviewerAgent,
+        }), 2500)
 
         prevOutput = await this._runRound(session)
         this._currentSession = null
@@ -207,6 +226,8 @@ class VolleyManager extends EventEmitter {
       return
     }
 
+    // Register synthesis session so resize + grace-kill apply (same as round sessions)
+    this.registerSession(synthSessionId, synthSession, synthAgent)
     // Track synthesis session so stop() / browser-close kills it cleanly
     this._currentSession = synthSession
     synthSession.on('data', evt => safeSend(ws, {

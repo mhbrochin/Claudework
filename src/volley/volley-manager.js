@@ -299,16 +299,31 @@ class VolleyManager extends EventEmitter {
       // Unit tests pass verdictCooldownMs=0 since they have no PTY echo.
       setTimeout(() => { verdictEnabled = true }, this.verdictCooldownMs)
 
+      // Rolling tail of STRIPPED output for VERDICT scanning.
+      // Testing raw chunks fails when the AI CLI wraps VERDICT in cursor-positioning
+      // sequences (e.g. \x1b[1G\x1b[K before the text) — \s* in VERDICT_RE won't
+      // skip those bytes.  A 500-char stripped tail also catches VERDICT split across
+      // PTY chunk boundaries.
+      let tailBuf      = ''
+      let verdictFired = false
+
       session.on('data', evt => {
         const chunk = evt.raw != null ? evt.raw : String(evt)
         accum.push(chunk)
+        tailBuf = (tailBuf + stripAnsi(chunk)).slice(-500)
         // Real-time VERDICT scan — end round immediately when found.
         // verdictEnabled guard ensures we only react to the model's own output, not the
         // echoed prompt text that was typed into the PTY during the injection window.
-        if (verdictEnabled && VERDICT_RE.test(chunk)) {
+        if (verdictEnabled && !verdictFired && VERDICT_RE.test(tailBuf)) {
+          verdictFired = true
           logger.debug('volley: VERDICT detected in reviewer stream — ending round')
-          // Small grace period so the model can finish the line it's on
-          setTimeout(() => { try { session.kill() } catch (_) {} }, 500)
+          // Grace period so the model can finish the line it's on, then settle directly
+          // rather than waiting for session exit — the AI CLI may take several seconds
+          // to clean up after SIGTERM, which would stall the volley loop.
+          setTimeout(() => {
+            try { session.kill() } catch (_) {}
+            settle()   // resolve now; session.once('exit', settle) is a belt-and-suspenders
+          }, 500)
         }
         resetTimer()
       })
@@ -343,10 +358,17 @@ class VolleyManager extends EventEmitter {
       // Unit tests pass liveCooldownMs=0 since they have no PTY echo.
       setTimeout(() => { verdictEnabled = true }, this.liveCooldownMs)
 
+      // Same rolling-tail approach as _runRound — ANSI sequences and chunk boundaries
+      // can prevent a raw-chunk VERDICT_RE match.
+      let tailBuf      = ''
+      let verdictFired = false
+
       const dataListener = evt => {
         const chunk = evt.raw != null ? evt.raw : String(evt)
         buf.push(chunk)
-        if (verdictEnabled && VERDICT_RE.test(chunk)) {
+        tailBuf = (tailBuf + stripAnsi(chunk)).slice(-500)
+        if (verdictEnabled && !verdictFired && VERDICT_RE.test(tailBuf)) {
+          verdictFired = true
           logger.debug('volley: VERDICT detected in live Panel A stream — ending round')
           setTimeout(finish, 500)  // grace period for the model to finish the line
           return

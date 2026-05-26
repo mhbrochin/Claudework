@@ -348,6 +348,18 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         return
       }
 
+      // ── resize ───────────────────────────────────────────────────────────
+      // Browser sends this after fit.fit() so the PTY matches xterm's column count.
+      // Without this, the PTY runs at its spawn size (120×30) while xterm is wider,
+      // causing ANSI cursor-movement sequences to land at wrong positions → garbled output.
+      if (msg.type === 'resize') {
+        const entry = sessions.get(msg.sessionId)
+        if (entry && entry.session && typeof entry.session.resize === 'function') {
+          try { entry.session.resize(msg.cols, msg.rows) } catch (_) {}
+        }
+        return
+      }
+
       // ── flag ─────────────────────────────────────────────────────────────
       if (msg.type === 'flag') {
         const entry  = sessions.get(msg.sessionId)
@@ -368,7 +380,8 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         const reviewerId    = crypto.randomUUID()
         let reviewer
         try {
-          reviewer = launchReviewer(sourceStore, reviewerAgent, workdir, null, null, { primaryAgent })
+          reviewer = launchReviewer(sourceStore, reviewerAgent, workdir, null, null,
+            { primaryAgent, cols: msg.cols, rows: msg.rows })
         } catch (err) {
           safeSend(ws, { type: 'ready', sessionId: reviewerId, agent: reviewerAgent, workdir, role: 'reviewer' })
           safeSend(ws, { type: 'output', sessionId: reviewerId, data: `\r\n[error] ${err.message}\r\n` })
@@ -401,7 +414,8 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         const crossId        = crypto.randomUUID()
         let crossSession
         try {
-          crossSession = launchReviewer(sourceStore, crossAgent, workdir, reviewerOutput, null, { primaryAgent })
+          crossSession = launchReviewer(sourceStore, crossAgent, workdir, reviewerOutput, null,
+            { primaryAgent, cols: msg.cols, rows: msg.rows })
         } catch (err) {
           safeSend(ws, { type: 'ready', sessionId: crossId, agent: crossAgent, workdir, role: 'cross-check' })
           safeSend(ws, { type: 'output', sessionId: crossId, data: `\r\n[error] ${err.message}\r\n` })
@@ -462,6 +476,7 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
 
         activeVolley = new VolleyManagerSafe({
           liveAgent, reviewerAgent, maxRounds, focusHint: msg.focusHint || '',
+          cols: msg.cols, rows: msg.rows,
         })
         activeVolley.once('done', ({ finalOutput }) => {
           if (finalOutput) capturedOutputs.set('volley-final', finalOutput)
@@ -521,6 +536,7 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
           liveAgent, reviewerAgent,
           maxRounds:  startFromRound + extraRounds,
           focusHint:  msg.focusHint || '',
+          cols: msg.cols, rows: msg.rows,
         })
         activeVolley.once('done', ({ finalOutput }) => {
           if (finalOutput) capturedOutputs.set('volley-final', finalOutput)

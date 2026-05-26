@@ -17,7 +17,7 @@ const chokidar = require('chokidar')
 const simpleGit = require('simple-git')
 const logger = require('../observability/logger')
 
-function createSession(command, workdir, sessionId) {
+function createSession(command, workdir, sessionId, { cols = 220, rows = 50 } = {}) {
   const { loadConfig } = require('../config/agent-config')
   const agentConfig = loadConfig()
   const agentEnv = (agentConfig[command] && agentConfig[command].env) || process.env
@@ -51,8 +51,8 @@ function createSession(command, workdir, sessionId) {
   try {
     shell = pty.spawn(loginShell, ['-lc', command], {
       name: 'xterm-256color',
-      cols: 120,
-      rows: 30,
+      cols,
+      rows,
       cwd: absWorkdir,
       env: agentEnv,
     })

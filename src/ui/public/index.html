@@ -322,9 +322,23 @@
       B: makePanel('termB', 'statusB', 'agentB', true),  // deferred — Panel B starts hidden
     }
 
+    // fitAndResize: fits the xterm terminal to its container AND tells the server
+    // so the PTY gets resized to match. Without the server resize, the PTY runs at
+    // its spawn size (120×30) while xterm is wider — ANSI cursor sequences land at
+    // wrong columns and output looks like garbled escape codes ([0 q[0 q...).
+    function fitAndResize(panelKey) {
+      const panel = panels[panelKey]
+      try {
+        panel.fit.fit()
+        if (panel.sessionId) {
+          send({ type: 'resize', sessionId: panel.sessionId, cols: panel.term.cols, rows: panel.term.rows })
+        }
+      } catch (_) {}
+    }
+
     window.addEventListener('resize', () => {
-      try { panels.A.fit.fit() } catch (_) {}
-      try { panels.B.fit.fit() } catch (_) {}
+      fitAndResize('A')
+      fitAndResize('B')
     })
 
     function log(tag, text) {
@@ -362,6 +376,13 @@
         send({ type: 'input', sessionId: panel.sessionId, data })
       })
 
+      // Tell the PTY its correct size immediately after the session is assigned.
+      // This is critical for Panel B: the reviewer PTY spawns at 120×30 but xterm
+      // may be a different size. The mismatch causes ANSI escape sequences to land
+      // at wrong columns, making output look like garbage ([0 q[0 q...).
+      // We fire in a rAF so the panel is fully laid out before we measure it.
+      requestAnimationFrame(() => { fitAndResize(panelKey) })
+
       panel.term.focus()
     }
 
@@ -374,12 +395,10 @@
       if (labelText) document.getElementById('panelBLabel').textContent = labelText
       if (roleText)  document.getElementById('roleB').textContent = roleText
       else            document.getElementById('roleB').textContent = ''
-      // Defer fit until after the browser reflows the split-column layout.
-      // Calling fit() synchronously here gets the pre-reflow dimensions (full width),
-      // which sets the wrong column count and clips text at the right edge.
+      // Defer fit+resize until after the browser reflows the split-column layout.
       requestAnimationFrame(() => {
-        try { panels.A.fit.fit() } catch (_) {}
-        try { panels.B.fit.fit() } catch (_) {}
+        fitAndResize('A')
+        fitAndResize('B')
       })
     }
 
@@ -585,7 +604,11 @@
     })
     document.getElementById('reviewGo').addEventListener('click', () => {
       const reviewerAgent = document.getElementById('reviewAgent').value
-      send({ type: 'review', sessionId: primarySessionId, reviewerAgent })
+      // Include current terminal dimensions so the reviewer PTY spawns at the right size.
+      // Panel A and B share the same split layout, so Panel A's cols/rows are a perfect proxy.
+      const termCols = panels.A.term.cols || 220
+      const termRows = panels.A.term.rows || 50
+      send({ type: 'review', sessionId: primarySessionId, reviewerAgent, cols: termCols, rows: termRows })
       document.getElementById('reviewModal').classList.add('hidden')
       log('info', `Launching ${reviewerAgent} reviewer`)
     })
@@ -601,7 +624,10 @@
     document.getElementById('volleyGo').addEventListener('click', () => {
       const maxRounds  = parseInt(document.getElementById('volleyRounds').value, 10)
       const focusHint  = document.getElementById('volleyFocus').value.trim()
-      send({ type: 'volley-start', sessionId: primarySessionId, maxRounds, ...(focusHint ? { focusHint } : {}) })
+      const termCols   = panels.A.term.cols || 220
+      const termRows   = panels.A.term.rows || 50
+      send({ type: 'volley-start', sessionId: primarySessionId, maxRounds, cols: termCols, rows: termRows,
+             ...(focusHint ? { focusHint } : {}) })
       document.getElementById('volleyModal').classList.add('hidden')
       log('volley', `Starting ${maxRounds}-round volley${focusHint ? ` — focus: ${focusHint}` : ''}`)
     })
@@ -618,7 +644,9 @@
     })
     document.getElementById('volleyContinueGo').addEventListener('click', () => {
       const extraRounds = parseInt(document.getElementById('volleyExtraRounds').value, 10)
-      send({ type: 'volley-continue', sessionId: primarySessionId, extraRounds })
+      const termCols    = panels.A.term.cols || 220
+      const termRows    = panels.A.term.rows || 50
+      send({ type: 'volley-continue', sessionId: primarySessionId, extraRounds, cols: termCols, rows: termRows })
       document.getElementById('volleyContinueModal').classList.add('hidden')
       log('volley', `Continuing volley — adding ${extraRounds} more round(s)`)
     })

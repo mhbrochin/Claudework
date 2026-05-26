@@ -28,12 +28,17 @@ const HARD_MAX_ROUNDS = 20
 const VERDICT_RE      = /VERDICT:\s*(CONVERGED|DIVERGED)/i
 
 class VolleyManager extends EventEmitter {
-  constructor({ maxRounds = 3, liveAgent = 'claude', reviewerAgent = 'codex', focusHint = '' } = {}) {
+  constructor({ maxRounds = 3, liveAgent = 'claude', reviewerAgent = 'codex', focusHint = '',
+                cols, rows } = {}) {
     super()
     this.maxRounds     = Math.min(Math.max(1, maxRounds), HARD_MAX_ROUNDS)
     this.liveAgent     = liveAgent       // the agent in Panel A (participates live)
     this.reviewerAgent = reviewerAgent   // the fresh-session reviewer
     this.focusHint     = focusHint
+    // Terminal dimensions — passed to launchReviewer so reviewer PTYs spawn at the right size.
+    // When provided (from browser), initial output renders correctly without waiting for resize.
+    this.cols          = cols
+    this.rows          = rows
     this.stopped       = false
     this._currentSession = null
   }
@@ -79,7 +84,8 @@ class VolleyManager extends EventEmitter {
         try {
           session = launchReviewer(
             store, this.reviewerAgent, workdir, debateHistory, null,
-            { focusHint: this.focusHint, primaryAgent: this.liveAgent }
+            { focusHint: this.focusHint, primaryAgent: this.liveAgent,
+              cols: this.cols, rows: this.rows }
           )
         } catch (err) {
           safeSend(ws, { type: 'volley-error', error: err.message, round })
@@ -192,7 +198,8 @@ class VolleyManager extends EventEmitter {
 
     let synthSession
     try {
-      synthSession = launchReviewer(store, synthAgent, workdir, null, synthPrompt)
+      synthSession = launchReviewer(store, synthAgent, workdir, null, synthPrompt,
+        { cols: this.cols, rows: this.rows })
     } catch (err) {
       logger.error({ err }, 'volley: synthesis launch failed')
       safeSend(ws, { type: 'volley-done', rounds: completedRounds.length, reason: 'synthesis-error' })

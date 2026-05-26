@@ -9,7 +9,9 @@
 //     workdir: path the reviewer should operate in
 //     reviewerOutput: optional — prior reviewer's output for cross-check / debate-history mode
 //     overridePrompt: optional — if provided, bypasses buildReviewPrompt entirely (used by synthesis)
-//     options: optional — { focusHint?, primaryAgent? } forwarded to buildReviewPrompt
+//     options: optional — { focusHint?, primaryAgent?, cols?, rows? } forwarded as needed
+//       cols/rows — PTY spawn dimensions; defaults to 220×50 so initial output renders correctly
+//       before the browser's resize message arrives. Pass actual xterm dimensions when known.
 //     Returns the same EventEmitter interface as createSession()
 
 const { EventEmitter } = require('events')
@@ -43,14 +45,23 @@ function launchReviewer(store, agent, workdir, reviewerOutput = null, overridePr
   // Build the review prompt — overridePrompt short-circuits buildReviewPrompt (used by synthesis)
   const prompt = overridePrompt || store.buildReviewPrompt(reviewerOutput, options)
 
+  // Use caller-supplied terminal dimensions when known (browser sends actual xterm cols/rows
+  // in the review/volley-start message). Default to 220×50 — larger than most screens so that
+  // ANSI cursor sequences in shell startup output land within xterm's viewport and render
+  // correctly in the first ~50ms before the browser's resize message arrives.
+  const spawnCols = (options.cols && Number.isInteger(options.cols) && options.cols > 0)
+    ? options.cols : 220
+  const spawnRows = (options.rows && Number.isInteger(options.rows) && options.rows > 0)
+    ? options.rows : 50
+
   const resolvedBin = (agentConfig[agent] && agentConfig[agent].bin) || agent
   // Spawn through the login shell so PATH includes wherever claude/codex are installed.
   // Mirrors the same pattern used in pty-session.js for primary sessions.
   const loginShell = process.env.SHELL || '/bin/bash'
   const proc = pty.spawn(loginShell, ['-lc', resolvedBin], {
     name: 'xterm-color',
-    cols: 120,
-    rows: 40,
+    cols: spawnCols,
+    rows: spawnRows,
     cwd: workdir,
     env: agentEnv,
   })

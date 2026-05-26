@@ -19,7 +19,7 @@ async function main() {
   if (!isConfigured('codex')) {
     logger.warn('[config] OPENAI_API_KEY not set — codex sessions will fail. Add it to .env')
   }
-  const storeFactory = (sessionId, workdir) => new ContextStore(sessionId, workdir)
+  const storeFactory = (sessionId, workdir, agent) => new ContextStore(sessionId, workdir, agent)
   startServer({ store: storeFactory, createSession, launchReviewer })
 }
 

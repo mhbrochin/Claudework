@@ -210,13 +210,13 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
 
     session.on('data', (evt) => {
       const raw = evt && evt.raw !== undefined ? evt.raw : evt
-      // Always buffer — even when no browser is connected (grace period / reconnect)
+      // Always buffer — even when no browser is connected (grace period / reconnect).
+      // We do NOT store individual chunks to SQLite here: Codex (and Claude) redraw their
+      // TUI on every render pass, producing thousands of duplicate-content chunks per session.
+      // Instead, we store a single clean output event on exit (see below).
       const prev = outputBuffers.get(sessionId) || ''
       const next = prev + raw
       outputBuffers.set(sessionId, next.length > MAX_BUFFER ? next.slice(-MAX_BUFFER) : next)
-      if (sessionStore && typeof sessionStore.append === 'function') {
-        try { sessionStore.append('output', { ts: Date.now(), raw }) } catch (_) {}
-      }
       // Forward to whichever ws is currently attached (null during grace period → drop)
       const e = sessions.get(sessionId)
       safeSend(e ? e.ws : ws, { type: 'output', sessionId, data: raw })
@@ -232,6 +232,15 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
     })
     session.on('exit', (evt) => {
       const code = evt && evt.code !== undefined ? evt.code : evt
+      // Store the full buffered output as a single event on exit.
+      // One event per session instead of thousands of per-chunk events — keeps the DB
+      // lean and avoids Codex/Claude TUI redraws inflating the row count.
+      if (sessionStore && typeof sessionStore.append === 'function') {
+        const buf = outputBuffers.get(sessionId) || ''
+        if (buf) {
+          try { sessionStore.append('output', { ts: Date.now(), raw: buf }) } catch (_) {}
+        }
+      }
       const e = sessions.get(sessionId)
       safeSend(e ? e.ws : ws, { type: 'exit', sessionId, code })
       sessions.delete(sessionId)
@@ -283,7 +292,7 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
         let sessionStore
         try {
           if (ContextStoreSafe) {
-            sessionStore = typeof store === 'function' ? store(sessionId, workdir) : store
+            sessionStore = typeof store === 'function' ? store(sessionId, workdir, agent) : store
           }
         } catch (err) {
           logger.warn({ err: err.message }, 'ContextStore failed, using memory store')

@@ -24,9 +24,14 @@ describe('ContextStore constructor', () => {
     expect(store.workdir).toBe('/my/workdir')
   })
 
-  test('calls createSession on construction', () => {
+  test('calls createSession on construction with null agent by default', () => {
     new ContextStore('s2', '/wd')
     expect(createSession).toHaveBeenCalledWith('s2', '/wd', null, expect.any(String))
+  })
+
+  test('passes agent to createSession when provided', () => {
+    new ContextStore('s2b', '/wd', 'codex')
+    expect(createSession).toHaveBeenCalledWith('s2b', '/wd', 'codex', expect.any(String))
   })
 
   test('defaults workdir to process.cwd() when omitted', () => {

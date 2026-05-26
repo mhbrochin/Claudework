@@ -95,7 +95,7 @@ let port
 
 beforeAll((done) => {
   server = startServer({
-    store: (sessionId, workdir) => new ContextStore(sessionId, workdir),
+    store: (sessionId, workdir, agent) => new ContextStore(sessionId, workdir, agent),
     createSession: createPtySession,
     launchReviewer,
     port: 0,   // OS assigns a free port

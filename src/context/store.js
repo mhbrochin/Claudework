@@ -41,10 +41,10 @@ const MAX_CMDS_CHARS    = 4000    // session commands section cap
 const MAX_LISTING_CHARS = 2000    // file listing cap
 
 class ContextStore {
-  constructor(sessionId, workdir) {
+  constructor(sessionId, workdir, agent = null) {
     this.sessionId = sessionId
     this.workdir = workdir || process.cwd()
-    createSession(sessionId, this.workdir, null, new Date().toISOString())
+    createSession(sessionId, this.workdir, agent, new Date().toISOString())
     logger.debug({ sessionId: this.sessionId }, 'store initialized')
   }
 

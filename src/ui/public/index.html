@@ -494,7 +494,9 @@
         } else if (role === 'reviewer' || role === 'cross-check') {
           reviewerSessionId = msg.sessionId
           const label = role === 'cross-check' ? 'Session B (Cross-Check)' : 'Session B (Reviewer)'
-          showReviewerPanel(label, msg.agent)
+          // Pass null for roleText — setActiveSession sets #agentB; passing agent here would
+          // also set #roleB, making the header show "CODEX CODEX" (double label).
+          showReviewerPanel(label, null)
           // skipResize=true: showReviewerPanel's rAF already handles fitAndResize('B')
           setActiveSession('B', msg.sessionId, msg.agent, { skipResize: true })
           setTimeout(() => panels.B.term.focus(), 300)
@@ -504,7 +506,8 @@
           // Fresh reviewer round — show in Panel B
           // BUG 4 FIX: keep reviewerSessionId current so "Send to Panel A" works mid-volley
           reviewerSessionId = msg.sessionId
-          showReviewerPanel('Session B (Volley)', msg.agent)
+          // Pass null for roleText — setActiveSession sets #agentB exclusively (no double label)
+          showReviewerPanel('Session B (Volley)', null)
           // skipResize=true: showReviewerPanel's rAF already handles fitAndResize('B')
           setActiveSession('B', msg.sessionId, msg.agent, { skipResize: true })
           setTimeout(() => panels.B.term.focus(), 300)
@@ -513,7 +516,8 @@
 
         } else if (role === 'volley-synthesis') {
           // Synthesis session — show in Panel B
-          showReviewerPanel('Session B (Synthesis)', msg.agent)
+          // Pass null for roleText — setActiveSession sets #agentB exclusively (no double label)
+          showReviewerPanel('Session B (Synthesis)', null)
           // skipResize=true: showReviewerPanel's rAF already handles fitAndResize('B')
           setActiveSession('B', msg.sessionId, msg.agent, { skipResize: true })
           setTimeout(() => panels.B.term.focus(), 300)

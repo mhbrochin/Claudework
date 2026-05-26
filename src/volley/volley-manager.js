@@ -25,11 +25,15 @@ const logger = require('../observability/logger')
 
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000   // 5 minutes — fallback only
 const HARD_MAX_ROUNDS = 20
-const VERDICT_RE      = /VERDICT:\s*(CONVERGED|DIVERGED)/i
+// VERDICT_RE: require start-of-line so inline examples in the review prompt
+// ("...end with: VERDICT: CONVERGED or: VERDICT: DIVERGED") do NOT match,
+// but the AI's actual standalone verdict line ("VERDICT: CONVERGED\n") does.
+const VERDICT_RE      = /(?:^|\n)\s*VERDICT:\s*(CONVERGED|DIVERGED)/i
 
 class VolleyManager extends EventEmitter {
   constructor({ maxRounds = 3, liveAgent = 'claude', reviewerAgent = 'codex', focusHint = '',
-                cols, rows, registerSession } = {}) {
+                cols, rows, registerSession,
+                verdictCooldownMs = 3500, liveCooldownMs = 1500 } = {}) {
     super()
     this.maxRounds     = Math.min(Math.max(1, maxRounds), HARD_MAX_ROUNDS)
     this.liveAgent     = liveAgent       // the agent in Panel A (participates live)
@@ -43,6 +47,13 @@ class VolleyManager extends EventEmitter {
     // server.js uses this to insert the session into the sessions Map so resize messages work
     // and the 60-second grace-kill applies to volley sessions too.
     this.registerSession = typeof registerSession === 'function' ? registerSession : () => {}
+    // verdictCooldownMs: how long to suppress VERDICT scanning after a reviewer session starts.
+    // Prevents false positives from the PTY echo of the injected prompt (which itself contains
+    // the VERDICT instruction examples). reviewer.js injects the prompt after 2s, so 3.5s gives
+    // the echo 1.5s extra to clear. Set to 0 in unit tests where there is no prompt echo.
+    this.verdictCooldownMs = verdictCooldownMs
+    // liveCooldownMs: same concept for Panel A paste echo in _runLiveRound.
+    this.liveCooldownMs    = liveCooldownMs
     this.stopped       = false
     this._currentSession = null
   }
@@ -133,7 +144,7 @@ class VolleyManager extends EventEmitter {
           body +
           `\r\n=== END REVIEW ===\r\n` +
           `Please respond to this review. Address specific disagreements.\r\n` +
-          `End your response with: VERDICT: CONVERGED or VERDICT: DIVERGED\r\n\r`
+          `End your response with a verdict line — either: VERDICT: CONVERGED (you agree) or: VERDICT: DIVERGED (you disagree)\r\n\r`
         )
         prevOutput = await this._runLiveRound(primarySession)
       }
@@ -259,9 +270,10 @@ class VolleyManager extends EventEmitter {
   // Resolves with the clean text output of the session.
   _runRound(session) {
     return new Promise(resolve => {
-      let timer   = null
-      let settled = false
-      const accum = []
+      let timer          = null
+      let settled        = false
+      let verdictEnabled = false  // suppressed until after prompt-echo window (see below)
+      const accum        = []
 
       const settle = () => {
         if (settled) return
@@ -278,11 +290,22 @@ class VolleyManager extends EventEmitter {
         }, IDLE_TIMEOUT_MS)
       }
 
+      // IMPORTANT: reviewer.js injects the prompt after a 2-second delay.  The PTY echoes
+      // the pasted prompt text back as terminal output.  The review prompt itself contains
+      // the literal text "VERDICT: CONVERGED" in the instructions, so without a cooldown the
+      // VERDICT regex would fire on the *echo* of the injected prompt (before the model has
+      // produced any output) — ending the round in ~2.5 seconds with empty output.
+      // Fix: enable VERDICT scanning only after verdictCooldownMs (default 3.5s = 2s injection + 1.5s buffer).
+      // Unit tests pass verdictCooldownMs=0 since they have no PTY echo.
+      setTimeout(() => { verdictEnabled = true }, this.verdictCooldownMs)
+
       session.on('data', evt => {
         const chunk = evt.raw != null ? evt.raw : String(evt)
         accum.push(chunk)
-        // Real-time VERDICT scan — end round immediately when found
-        if (VERDICT_RE.test(chunk)) {
+        // Real-time VERDICT scan — end round immediately when found.
+        // verdictEnabled guard ensures we only react to the model's own output, not the
+        // echoed prompt text that was typed into the PTY during the injection window.
+        if (verdictEnabled && VERDICT_RE.test(chunk)) {
           logger.debug('volley: VERDICT detected in reviewer stream — ending round')
           // Small grace period so the model can finish the line it's on
           setTimeout(() => { try { session.kill() } catch (_) {} }, 500)
@@ -299,9 +322,10 @@ class VolleyManager extends EventEmitter {
   // Listens on primarySession for output after the paste, resolves when VERDICT found or idle.
   _runLiveRound(primarySession) {
     return new Promise(resolve => {
-      const buf   = []
-      let timer   = null
-      let settled = false
+      const buf          = []
+      let timer          = null
+      let settled        = false
+      let verdictEnabled = false  // suppressed during paste-echo window (see below)
 
       const finish = () => {
         if (settled) return
@@ -312,10 +336,17 @@ class VolleyManager extends EventEmitter {
         resolve(stripAnsi(raw))
       }
 
+      // IMPORTANT: the paste written to primarySession ends with the literal text
+      // "VERDICT: CONVERGED or VERDICT: DIVERGED".  The PTY echoes this back immediately.
+      // Without a cooldown, VERDICT detection fires on the echo rather than Claude's response.
+      // liveCooldownMs (default 1.5s) is enough for the paste echo to clear.
+      // Unit tests pass liveCooldownMs=0 since they have no PTY echo.
+      setTimeout(() => { verdictEnabled = true }, this.liveCooldownMs)
+
       const dataListener = evt => {
         const chunk = evt.raw != null ? evt.raw : String(evt)
         buf.push(chunk)
-        if (VERDICT_RE.test(chunk)) {
+        if (verdictEnabled && VERDICT_RE.test(chunk)) {
           logger.debug('volley: VERDICT detected in live Panel A stream — ending round')
           setTimeout(finish, 500)  // grace period for the model to finish the line
           return

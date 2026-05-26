@@ -165,7 +165,11 @@ describe('ContextStore.buildReviewPrompt()', () => {
   test('includes VERDICT instruction in review instructions', () => {
     const store  = new ContextStore('s18', '/wd')
     const prompt = store.buildReviewPrompt()
-    expect(prompt).toContain('VERDICT: CONVERGED or VERDICT: DIVERGED')
+    // Check for the VERDICT keyword and both outcomes — the exact wording may vary
+    // but the instruction must tell the reviewer to produce a VERDICT line.
+    expect(prompt).toContain('VERDICT:')
+    expect(prompt).toContain('CONVERGED')
+    expect(prompt).toContain('DIVERGED')
   })
 
   test('includes diffs in prompt', () => {

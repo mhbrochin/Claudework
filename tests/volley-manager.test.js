@@ -88,6 +88,9 @@ const WS_MOCK = {}   // ws arg is only forwarded to safeSend — not used by Vol
 /** Default no-op registerSession mock — keeps tests clean unless we're testing registration. */
 const noopRegister = jest.fn()
 
+/** Zero cooldowns for tests — no PTY echo, so no false-positive VERDICT suppression needed. */
+const TEST_OPTS = { verdictCooldownMs: 0, liveCooldownMs: 0 }
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 beforeEach(() => jest.clearAllMocks())
@@ -101,7 +104,7 @@ test('1. both CONVERGED → stops early, synthesis runs, volley-done reason:conv
 
   const primarySession = mockPrimarySession({ verdict: 'CONVERGED' })
   const safeSend = makeSafeSend()
-  const vm = new VolleyManager({ maxRounds: 3, liveAgent: 'claude', reviewerAgent: 'codex' })
+  const vm = new VolleyManager({ maxRounds: 3, liveAgent: 'claude', reviewerAgent: 'codex', ...TEST_OPTS })
 
   await vm.run(mockStore(), '/workdir', primarySession, WS_MOCK, safeSend)
 
@@ -122,7 +125,7 @@ test('2. stop() ends the volley, no synthesis, reason:stopped', async () => {
 
   const primarySession = mockPrimarySession()
   const safeSend = makeSafeSend()
-  const vm = new VolleyManager({ maxRounds: 3, liveAgent: 'claude', reviewerAgent: 'codex' })
+  const vm = new VolleyManager({ maxRounds: 3, liveAgent: 'claude', reviewerAgent: 'codex', ...TEST_OPTS })
 
   const runPromise = vm.run(mockStore(), '/workdir', primarySession, WS_MOCK, safeSend)
   setTimeout(() => vm.stop(), 50)
@@ -141,7 +144,7 @@ test('3. VERDICT in stream ends round without waiting for 5-min timeout', async 
 
   const primarySession = mockPrimarySession({ verdict: 'DIVERGED' })
   const safeSend = makeSafeSend()
-  const vm = new VolleyManager({ maxRounds: 1, liveAgent: 'claude', reviewerAgent: 'codex' })
+  const vm = new VolleyManager({ maxRounds: 1, liveAgent: 'claude', reviewerAgent: 'codex', ...TEST_OPTS })
 
   const start = Date.now()
   await vm.run(mockStore(), '/workdir', primarySession, WS_MOCK, safeSend)
@@ -159,7 +162,7 @@ test('4. convergence detected after round pair → breaks early, runs synthesis'
 
   const primarySession = mockPrimarySession({ verdict: 'CONVERGED' })
   const safeSend = makeSafeSend()
-  const vm = new VolleyManager({ maxRounds: 10, liveAgent: 'claude', reviewerAgent: 'codex' })
+  const vm = new VolleyManager({ maxRounds: 10, liveAgent: 'claude', reviewerAgent: 'codex', ...TEST_OPTS })
 
   await vm.run(mockStore(), '/workdir', primarySession, WS_MOCK, safeSend)
 
@@ -177,7 +180,7 @@ test('5. round limit → canContinue:true, synthesis with where-things-left-off 
 
   const primarySession = mockPrimarySession({ verdict: 'DIVERGED' })
   const safeSend = makeSafeSend()
-  const vm = new VolleyManager({ maxRounds: 1, liveAgent: 'claude', reviewerAgent: 'codex' })
+  const vm = new VolleyManager({ maxRounds: 1, liveAgent: 'claude', reviewerAgent: 'codex', ...TEST_OPTS })
 
   await vm.run(mockStore(), '/workdir', primarySession, WS_MOCK, safeSend)
 
@@ -199,7 +202,7 @@ test('6. resume with priorRounds — launchReviewer receives full debate history
   ]
   const primarySession = mockPrimarySession({ verdict: 'DIVERGED' })
   const safeSend = makeSafeSend()
-  const vm = new VolleyManager({ maxRounds: 3, liveAgent: 'claude', reviewerAgent: 'codex' })
+  const vm = new VolleyManager({ maxRounds: 3, liveAgent: 'claude', reviewerAgent: 'codex', ...TEST_OPTS })
 
   await vm.run(mockStore(), '/workdir', primarySession, WS_MOCK, safeSend,
                2, priorRounds[1].output, priorRounds)
@@ -217,7 +220,7 @@ test('7. reviewer launch throws → volley-error emitted, loop breaks cleanly', 
   launchReviewer.mockImplementation(() => { throw new Error('CLI not found') })
 
   const safeSend = makeSafeSend()
-  const vm = new VolleyManager({ maxRounds: 3, liveAgent: 'claude', reviewerAgent: 'codex' })
+  const vm = new VolleyManager({ maxRounds: 3, liveAgent: 'claude', reviewerAgent: 'codex', ...TEST_OPTS })
 
   await vm.run(mockStore(), '/workdir', mockPrimarySession(), WS_MOCK, safeSend)
 
@@ -240,7 +243,7 @@ test('8. session exits immediately → resolves with capturedOutput', async () =
     .mockImplementationOnce(() => mockSession({ verdict: 'DIVERGED' }))  // synthesis
 
   const safeSend = makeSafeSend()
-  const vm = new VolleyManager({ maxRounds: 1, liveAgent: 'claude', reviewerAgent: 'codex' })
+  const vm = new VolleyManager({ maxRounds: 1, liveAgent: 'claude', reviewerAgent: 'codex', ...TEST_OPTS })
 
   await vm.run(mockStore(), '/workdir', mockPrimarySession({ verdict: 'DIVERGED' }), WS_MOCK, safeSend)
 
@@ -276,7 +279,7 @@ test('12. focusHint is passed to launchReviewer options', async () => {
 
   const safeSend = makeSafeSend()
   const vm = new VolleyManager({
-    maxRounds: 1, liveAgent: 'claude', reviewerAgent: 'codex', focusHint: 'trading logic',
+    maxRounds: 1, liveAgent: 'claude', reviewerAgent: 'codex', focusHint: 'trading logic', ...TEST_OPTS,
   })
 
   await vm.run(mockStore(), '/workdir', mockPrimarySession({ verdict: 'DIVERGED' }), WS_MOCK, safeSend)
@@ -294,7 +297,7 @@ test('13. round 2 reviewer receives full debate history (rounds 0 and 1)', async
 
   const primarySession = mockPrimarySession({ verdict: 'DIVERGED' })
   const safeSend = makeSafeSend()
-  const vm = new VolleyManager({ maxRounds: 3, liveAgent: 'claude', reviewerAgent: 'codex' })
+  const vm = new VolleyManager({ maxRounds: 3, liveAgent: 'claude', reviewerAgent: 'codex', ...TEST_OPTS })
 
   await vm.run(mockStore(), '/workdir', primarySession, WS_MOCK, safeSend)
 
@@ -319,7 +322,7 @@ test('15. registerSession is called for each reviewer round + synthesis session'
   const registerSession = jest.fn()
 
   const vm = new VolleyManager({
-    maxRounds: 1, liveAgent: 'claude', reviewerAgent: 'codex', registerSession,
+    maxRounds: 1, liveAgent: 'claude', reviewerAgent: 'codex', registerSession, ...TEST_OPTS,
   })
   await vm.run(mockStore(), '/workdir', primarySession, WS_MOCK, safeSend)
 
@@ -349,7 +352,7 @@ test('14. _currentSession holds synthesis session during synthesis, null after',
 
   const primarySession = mockPrimarySession({ verdict: 'DIVERGED' })
   const safeSend = makeSafeSend()
-  const vm = new VolleyManager({ maxRounds: 1, liveAgent: 'claude', reviewerAgent: 'codex' })
+  const vm = new VolleyManager({ maxRounds: 1, liveAgent: 'claude', reviewerAgent: 'codex', ...TEST_OPTS })
 
   // Wrap _runRound to observe _currentSession during synthesis
   let currentSessionDuringSynth = undefined

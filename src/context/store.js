@@ -167,7 +167,7 @@ class ContextStore {
         isDebateHistory
           ? 'You have the full debate history above. Continue the debate where it left off. ' +
             'Address specific points from the most recent round. Build on prior analysis. ' +
-            'End your response with: VERDICT: CONVERGED or VERDICT: DIVERGED'
+            'End your response with a verdict line — either: VERDICT: CONVERGED (you agree with the primary agent) or: VERDICT: DIVERGED (you disagree)'
           : `You have ${primaryAgent}'s session output above and a prior reviewer's analysis. ` +
             'State clearly where you agree and disagree with the reviewer. ' +
             'Call out any contradictions. Provide your own synthesis and final rating 1-10.'
@@ -182,7 +182,7 @@ class ContextStore {
         '4. For each flagged decision, say whether it makes sense and suggest alternatives\n' +
         '5. List what is missing or could be improved\n' +
         '6. Rate overall quality 1-10 with reasoning\n' +
-        '7. End your response with: VERDICT: CONVERGED or VERDICT: DIVERGED'
+        '7. End your response with a verdict line — either: VERDICT: CONVERGED (you agree with the primary agent) or: VERDICT: DIVERGED (you disagree)'
       )
     }
 

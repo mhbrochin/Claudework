@@ -7,6 +7,7 @@
 //     WebSocket message protocol:
 //       browser → server: { type: 'input',          sessionId, data }
 //                         { type: 'start',           agent, workdir, task? }
+//                         { type: 'reconnect',       sessionId }           ← resume after refresh
 //                         { type: 'review',          sessionId, reviewerAgent }
 //                         { type: 'flag',            sessionId, note }
 //                         { type: 'cross-check',     sourceSessionId, reviewerSessionId, agent? }
@@ -16,8 +17,9 @@
 //                         { type: 'volley-continue', sessionId, extraRounds?, focusHint? }
 //       server → browser: { type: 'output',               sessionId, data }
 //                         { type: 'diff',                 sessionId, file, patch }
-//                         { type: 'ready',                sessionId, role }
+//                         { type: 'ready',                sessionId, role, reconnect? }
 //                         { type: 'exit',                 sessionId, code }
+//                         { type: 'reconnect-fail',       sessionId, reason }
 //                         { type: 'reviewer-done',        reviewerSessionId, sourceSessionId }
 //                         { type: 'volley-round-start',   round, agent, maxRounds }
 //                         { type: 'volley-round-complete',round, agent, output }
@@ -78,6 +80,14 @@ class MemoryStore {
 }
 
 function startServer({ store, createSession, launchReviewer, port = 3000 }) {
+  // ── Session survival across browser refresh ──────────────────────────────────
+  // outputBuffers: last 100 KB of terminal output per session, replayed on reconnect.
+  // Sessions are NOT killed immediately on WebSocket close — a 60-second grace period
+  // lets a browser refresh reconnect and restore the terminal without losing the process.
+  const outputBuffers = new Map()   // sessionId → string
+  const MAX_BUFFER    = 100 * 1024  // 100 KB per session
+  const GRACE_MS      = 60_000      // 60 s before a disconnected session is killed
+
   const app = express()
   app.use(express.static(path.join(__dirname, 'public')))
 
@@ -185,17 +195,31 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
 
   const safeSend = (ws, msg) => {
     try {
-      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg))
+      if (ws && ws.readyState === 1 /* OPEN */) ws.send(JSON.stringify(msg))
     } catch (_) {}
   }
 
+  // wireSession wires PTY events to the browser.
+  // Crucially, it does NOT capture `ws` for sending — instead it looks up
+  // entry.ws at send-time so reconnect (which updates entry.ws) transparently
+  // re-routes output to the new WebSocket without re-registering any listeners.
   const wireSession = (ws, sessionId, session, sessionStore) => {
+    // Store initial ws reference in the sessions entry
+    const initEntry = sessions.get(sessionId)
+    if (initEntry) initEntry.ws = ws
+
     session.on('data', (evt) => {
       const raw = evt && evt.raw !== undefined ? evt.raw : evt
+      // Always buffer — even when no browser is connected (grace period / reconnect)
+      const prev = outputBuffers.get(sessionId) || ''
+      const next = prev + raw
+      outputBuffers.set(sessionId, next.length > MAX_BUFFER ? next.slice(-MAX_BUFFER) : next)
       if (sessionStore && typeof sessionStore.append === 'function') {
         try { sessionStore.append('output', { ts: Date.now(), raw }) } catch (_) {}
       }
-      safeSend(ws, { type: 'output', sessionId, data: raw })
+      // Forward to whichever ws is currently attached (null during grace period → drop)
+      const e = sessions.get(sessionId)
+      safeSend(e ? e.ws : ws, { type: 'output', sessionId, data: raw })
     })
     session.on('diff', (evt) => {
       const file  = evt && evt.file
@@ -203,12 +227,15 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
       if (sessionStore && typeof sessionStore.append === 'function') {
         try { sessionStore.append('diff', { ts: Date.now(), file, patch }) } catch (_) {}
       }
-      safeSend(ws, { type: 'diff', sessionId, file, patch })
+      const e = sessions.get(sessionId)
+      safeSend(e ? e.ws : ws, { type: 'diff', sessionId, file, patch })
     })
     session.on('exit', (evt) => {
       const code = evt && evt.code !== undefined ? evt.code : evt
-      safeSend(ws, { type: 'exit', sessionId, code })
+      const e = sessions.get(sessionId)
+      safeSend(e ? e.ws : ws, { type: 'exit', sessionId, code })
       sessions.delete(sessionId)
+      outputBuffers.delete(sessionId)
     })
   }
 
@@ -277,10 +304,35 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
           safeSend(ws, { type: 'exit', sessionId, code: -1 })
           return
         }
-        sessions.set(sessionId, { session, store: sessionStore, agent, workdir })
+        sessions.set(sessionId, { session, store: sessionStore, agent, workdir, ws: null, killTimer: null })
         ownedSessions.add(sessionId)
         wireSession(ws, sessionId, session, sessionStore)
         safeSend(ws, { type: 'ready', sessionId, agent, workdir, role: 'primary' })
+        return
+      }
+
+      // ── reconnect ────────────────────────────────────────────────────────────
+      // Browser sends this on page load when it finds a prior session in sessionStorage.
+      // If the session is still alive (within the 60-second grace window), we cancel
+      // the kill timer, re-attach this WebSocket, and replay the output buffer.
+      if (msg.type === 'reconnect') {
+        const sessionId = msg.sessionId
+        const entry     = sessions.get(sessionId)
+        if (!entry) {
+          safeSend(ws, { type: 'reconnect-fail', sessionId, reason: 'Session expired — start a new session' })
+          return
+        }
+        // Cancel the pending kill timer
+        if (entry.killTimer) { clearTimeout(entry.killTimer); entry.killTimer = null }
+        // Re-attach this WebSocket so live output flows here again
+        entry.ws = ws
+        ownedSessions.add(sessionId)
+        // Tell the browser the session is restored (role: primary so UI re-enables buttons)
+        safeSend(ws, { type: 'ready', sessionId, agent: entry.agent, workdir: entry.workdir, role: 'primary', reconnect: true })
+        // Replay buffered output to restore the terminal view
+        const buf = outputBuffers.get(sessionId)
+        if (buf) safeSend(ws, { type: 'output', sessionId, data: buf })
+        logger.info({ sessionId, agent: entry.agent }, 'session reconnected after browser refresh')
         return
       }
 
@@ -323,7 +375,7 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
           safeSend(ws, { type: 'exit', sessionId: reviewerId, code: -1 })
           return
         }
-        sessions.set(reviewerId, { session: reviewer, store: sourceStore, agent: reviewerAgent, workdir })
+        sessions.set(reviewerId, { session: reviewer, store: sourceStore, agent: reviewerAgent, workdir, ws: null, killTimer: null })
         ownedSessions.add(reviewerId)
         // Register BEFORE wireSession so this fires first on exit (EventEmitter fires in
         // registration order). wireSession's exit handler deletes the session from the Map,
@@ -356,7 +408,7 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
           safeSend(ws, { type: 'exit', sessionId: crossId, code: -1 })
           return
         }
-        sessions.set(crossId, { session: crossSession, store: sourceStore, agent: crossAgent, workdir })
+        sessions.set(crossId, { session: crossSession, store: sourceStore, agent: crossAgent, workdir, ws: null, killTimer: null })
         ownedSessions.add(crossId)
         wireSession(ws, crossId, crossSession, sourceStore)
         safeSend(ws, { type: 'ready', sessionId: crossId, agent: crossAgent, workdir, role: 'cross-check', sourceSessionId: msg.sourceSessionId })
@@ -488,15 +540,24 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
     })
 
     ws.on('close', () => {
-      // Stop any running volley
+      // Stop any running volley immediately — it owns no persistent state worth saving
       if (activeVolley) { activeVolley.stop(); activeVolley = null }
-      // Kill all sessions owned by this connection
+      // Disconnect the WebSocket from all owned sessions but do NOT kill them yet.
+      // Give the browser 60 seconds to reconnect (e.g. accidental refresh).
+      // If no reconnect arrives within the grace window, the kill timer fires.
       for (const id of ownedSessions) {
         const entry = sessions.get(id)
-        if (entry && entry.session && typeof entry.session.kill === 'function') {
-          try { entry.session.kill() } catch (_) {}
-        }
-        sessions.delete(id)
+        if (!entry) continue
+        entry.ws = null   // stop forwarding output to the now-closed socket
+        entry.killTimer = setTimeout(() => {
+          const e = sessions.get(id)
+          if (e && e.session && typeof e.session.kill === 'function') {
+            try { e.session.kill() } catch (_) {}
+          }
+          sessions.delete(id)
+          outputBuffers.delete(id)
+          logger.info({ sessionId: id }, 'dormant session killed after grace period')
+        }, GRACE_MS)
       }
       capturedOutputs.clear()
     })

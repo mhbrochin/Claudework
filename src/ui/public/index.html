@@ -89,7 +89,8 @@
     .term {
       flex: 1 1 auto;
       min-height: 0;
-      padding: 4px;
+      min-width: 0;
+      overflow: hidden;
       background: #0d1117;
     }
     #panelB.hidden { display: none; }
@@ -291,6 +292,7 @@
     function makePanel(termId, statusId, agentId, deferOpen = false) {
       const term = new Terminal({
         convertEol: true,
+        scrollback: 5000,
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
         fontSize: 12,
         theme: { background: '#0d1117', foreground: '#e6edf3' },
@@ -372,8 +374,13 @@
       if (labelText) document.getElementById('panelBLabel').textContent = labelText
       if (roleText)  document.getElementById('roleB').textContent = roleText
       else            document.getElementById('roleB').textContent = ''
-      try { panels.A.fit.fit() } catch (_) {}
-      try { panels.B.fit.fit() } catch (_) {}
+      // Defer fit until after the browser reflows the split-column layout.
+      // Calling fit() synchronously here gets the pre-reflow dimensions (full width),
+      // which sets the wrong column count and clips text at the right edge.
+      requestAnimationFrame(() => {
+        try { panels.A.fit.fit() } catch (_) {}
+        try { panels.B.fit.fit() } catch (_) {}
+      })
     }
 
     // Clicking anywhere in panel B (header, term, etc.) ensures it's open and focused
@@ -382,6 +389,15 @@
     ws.addEventListener('open', () => {
       statusEl.textContent = 'connected'
       log('info', 'WebSocket connected')
+      // Attempt to restore a prior session (survives browser refresh within 60s grace window)
+      try {
+        const saved = sessionStorage.getItem('cb_session')
+        if (saved) {
+          const { sessionId, agent } = JSON.parse(saved)
+          log('info', `Attempting to restore prior ${agent} session…`)
+          send({ type: 'reconnect', sessionId })
+        }
+      } catch (_) {}
     })
     ws.addEventListener('close', () => {
       statusEl.textContent = 'disconnected'
@@ -410,7 +426,13 @@
           primarySessionId = msg.sessionId
           primaryAgent     = msg.agent
           setActiveSession('A', msg.sessionId, msg.agent)
-          log('ready', `Session A ready (${msg.agent}) — ${msg.sessionId}`)
+          // Persist to sessionStorage so a browser refresh can reconnect within 60s
+          try { sessionStorage.setItem('cb_session', JSON.stringify({ sessionId: msg.sessionId, agent: msg.agent })) } catch (_) {}
+          if (msg.reconnect) {
+            log('ready', `Session A restored (${msg.agent}) — terminal replaying…`)
+          } else {
+            log('ready', `Session A ready (${msg.agent}) — ${msg.sessionId}`)
+          }
           document.getElementById('btnFlag').disabled = false
           document.getElementById('btnReview').disabled = false
           document.getElementById('btnVolleyStart').disabled = false
@@ -453,6 +475,12 @@
       } else if (msg.type === 'diff') {
         log('diff', `${msg.file}\n${msg.patch || ''}`)
 
+      // ── reconnect-fail ─────────────────────────────────────────────────
+      } else if (msg.type === 'reconnect-fail') {
+        // Session expired before we reconnected — clear saved state
+        try { sessionStorage.removeItem('cb_session') } catch (_) {}
+        log('info', `Prior session expired — ${msg.reason}`)
+
       // ── exit ───────────────────────────────────────────────────────────
       } else if (msg.type === 'exit') {
         log('exit', `session ${msg.sessionId} exited (code ${msg.code})`)
@@ -460,8 +488,9 @@
           panel.statusEl.textContent = `exited (${msg.code})`
           panel.statusEl.classList.remove('active')
         }
-        // If the primary session exits, disable primary-only buttons
+        // If the primary session exits cleanly, clear sessionStorage — no point reconnecting
         if (msg.sessionId === primarySessionId) {
+          try { sessionStorage.removeItem('cb_session') } catch (_) {}
           document.getElementById('btnFlag').disabled = true
           document.getElementById('btnReview').disabled = true
           document.getElementById('btnVolleyStart').disabled = true

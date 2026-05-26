@@ -146,7 +146,10 @@ class VolleyManager extends EventEmitter {
           `Please respond to this review. Address specific disagreements.\r\n` +
           `End your response with a verdict line — either: VERDICT: CONVERGED (you agree) or: VERDICT: DIVERGED (you disagree)\r\n\r`
         )
+        // BUG-2 FIX: track live session so stop() can kill it even during Panel A turns
+        this._currentSession = primarySession
         prevOutput = await this._runLiveRound(primarySession)
+        this._currentSession = null
       }
 
       completedRounds.push({
@@ -287,6 +290,9 @@ class VolleyManager extends EventEmitter {
         timer = setTimeout(() => {
           logger.warn({ pid: session.pid }, 'volley: 5-min idle timeout — ending round')
           try { session.kill() } catch (_) {}
+          // BUG-11 FIX: settle directly (mirror VERDICT path) — don't wait for session.exit
+          // which can stall indefinitely if the AI CLI takes a long time to clean up after SIGTERM.
+          settle()
         }, IDLE_TIMEOUT_MS)
       }
 

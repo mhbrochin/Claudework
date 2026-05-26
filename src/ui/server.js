@@ -623,7 +623,11 @@ function startServer({ store, createSession, launchReviewer, port = 3000 }) {
           logger.info({ sessionId: id }, 'dormant session killed after grace period')
         }, GRACE_MS)
       }
-      capturedOutputs.clear()
+      // BUG-1 FIX: Do NOT clear capturedOutputs on ws.close.
+      // capturedOutputs is a fresh Map for each connection (declared in wss.on('connection')),
+      // so there's nothing to "clean up" here — it will be GC'd with the closure.
+      // Clearing it immediately on close also wiped out reviewer output during the 60-second
+      // grace window, breaking cross-check and send-to-primary after an accidental refresh.
     })
   })
 
